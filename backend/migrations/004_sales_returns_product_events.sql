@@ -1,0 +1,11 @@
+ALTER TYPE sale_status ADD VALUE IF NOT EXISTS 'RETURNED';
+ALTER TYPE sale_status ADD VALUE IF NOT EXISTS 'PARTIALLY_RETURNED';
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS sale_number bigint;
+CREATE SEQUENCE IF NOT EXISTS sales_sale_number_seq;
+UPDATE sales SET sale_number = nextval('sales_sale_number_seq') WHERE sale_number IS NULL;
+ALTER TABLE sales ALTER COLUMN sale_number SET DEFAULT nextval('sales_sale_number_seq');
+ALTER TABLE sales ALTER COLUMN sale_number SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS sales_sale_number_idx ON sales(sale_number);
+CREATE TABLE IF NOT EXISTS sale_refunds (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), sale_id uuid NOT NULL REFERENCES sales(id), sale_item_id uuid NOT NULL REFERENCES sale_items(id), amount numeric(12,2) NOT NULL CHECK(amount>0), reason text NOT NULL, created_by uuid NOT NULL REFERENCES users(id), created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS product_events (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), product_id uuid REFERENCES products(id) ON DELETE SET NULL, action text NOT NULL, user_id uuid NOT NULL REFERENCES users(id), notes text, created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE product_events ADD COLUMN IF NOT EXISTS product_name text;
