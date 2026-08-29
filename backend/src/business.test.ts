@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   businessDate,
+  calculateReservationBalance,
   calculateSaleBalance,
   isValidDateOnly,
   nextDeliveryStatus,
@@ -54,6 +55,15 @@ describe("sale balances", () => {
       paid: 0,
       remaining: 0,
       paymentStatus: "PAID",
+    });
+  });
+});
+
+describe("reservation balances", () => {
+  it("treats the negotiated price as a unit price", () => {
+    expect(calculateReservationBalance(5, 100, 100)).toEqual({
+      total: 500,
+      remaining: 400,
     });
   });
 });

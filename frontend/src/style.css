@@ -11,7 +11,8 @@ body {
 }
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
   padding: 9px 12px;
   border: 1px solid #cbd1d8;
@@ -23,7 +24,7 @@ button {
   color: white;
   cursor: pointer;
   border: 0;
-  border-radius: 999px;
+  border-radius: 12px;
 }
 .shell {
   display: grid;

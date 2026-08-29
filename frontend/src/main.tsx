@@ -1,11 +1,17 @@
-import React, { useEffect as reactUseEffect, useState } from "react";
+import React, {
+  useEffect as reactUseEffect,
+  useRef,
+  useState,
+} from "react";
 import { createRoot } from "react-dom/client";
 import {
   BrowserRouter,
+  Link,
   Navigate,
   NavLink,
   Routes,
   Route,
+  useParams,
 } from "react-router-dom";
 import "@fontsource/open-sans/latin-400.css";
 import "@fontsource/open-sans/latin-500.css";
@@ -49,6 +55,160 @@ class ErrorBoundary extends React.Component<
       );
     return this.props.children;
   }
+}
+
+type NumericInputProps = Omit<
+  React.InputHTMLAttributes<HTMLInputElement>,
+  "type" | "inputMode" | "pattern" | "step"
+> & { integer?: boolean; hideValidationMessage?: boolean };
+
+function NumericInput({
+  integer = false,
+  hideValidationMessage = true,
+  onChange,
+  onKeyDown,
+  onPaste,
+  onDrop,
+  onBlur,
+  onInvalid,
+  value,
+  defaultValue,
+  min,
+  max,
+  ...props
+}: NumericInputProps) {
+  const [validationError, setValidationError] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const lastValidValue = useRef(String(value ?? defaultValue ?? ""));
+  const editingPattern = integer
+    ? /^(?:|0|[1-9]\d*)$/
+    : /^(?:|0(?:\.\d*)?|[1-9]\d*(?:\.\d*)?)$/;
+  const completePattern = integer
+    ? /^(?:0|[1-9]\d*)$/
+    : /^(?:0|[1-9]\d*)(?:\.\d+)?$/;
+  const htmlPattern = integer
+    ? "(?:0|[1-9][0-9]*)"
+    : "(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?";
+  const formatError = integer
+    ? "Enter a whole number without leading zeroes."
+    : "Enter a number without leading zeroes, using at most one decimal point.";
+
+  const showError = (element: HTMLInputElement, message = formatError) => {
+    element.setCustomValidity(message);
+    setValidationError(message);
+  };
+  const clearError = (element: HTMLInputElement) => {
+    element.setCustomValidity("");
+    setValidationError("");
+  };
+  const rangeError = (raw: string) => {
+    if (!raw || !completePattern.test(raw)) return "";
+    const numericValue = Number(raw);
+    const minimum = min === undefined ? undefined : Number(min);
+    const maximum = max === undefined ? undefined : Number(max);
+    if (
+      (minimum !== undefined && numericValue < minimum) ||
+      (maximum !== undefined && numericValue > maximum)
+    )
+      return "Enter a value within the allowed range.";
+    return "";
+  };
+
+  reactUseEffect(() => {
+    if (value !== undefined) lastValidValue.current = String(value ?? "");
+    const element = inputRef.current;
+    if (!element) return;
+    const raw = element.value;
+    const message = raw && completePattern.test(raw) ? rangeError(raw) : "";
+    if (message) showError(element, message);
+    else if (!raw || completePattern.test(raw)) clearError(element);
+  }, [value, min, max, integer]);
+
+  return (
+    <>
+      <input
+        ref={inputRef}
+        {...props}
+        type="text"
+        inputMode={integer ? "numeric" : "decimal"}
+        pattern={htmlPattern}
+        value={value}
+        defaultValue={defaultValue}
+        aria-invalid={Boolean(validationError)}
+        onKeyDown={(event) => {
+          onKeyDown?.(event);
+          if (event.defaultPrevented || event.ctrlKey || event.metaKey || event.altKey)
+            return;
+          const key = event.key;
+          if (key.length !== 1) return;
+          const allowedDigit = /^\d$/.test(key);
+          const allowedDecimal =
+            !integer && key === "." && !event.currentTarget.value.includes(".");
+          if (!allowedDigit && !allowedDecimal) {
+            event.preventDefault();
+            showError(event.currentTarget);
+          } else {
+            clearError(event.currentTarget);
+          }
+        }}
+        onPaste={(event) => {
+          onPaste?.(event);
+          if (event.defaultPrevented) return;
+          const pasted = event.clipboardData.getData("text").trim();
+          if (!completePattern.test(pasted)) {
+            event.preventDefault();
+            showError(event.currentTarget);
+          }
+        }}
+        onDrop={(event) => {
+          onDrop?.(event);
+          if (event.defaultPrevented) return;
+          const dropped = event.dataTransfer.getData("text").trim();
+          if (!completePattern.test(dropped)) {
+            event.preventDefault();
+            showError(event.currentTarget);
+          }
+        }}
+        onChange={(event) => {
+          const raw = event.currentTarget.value;
+          if (!editingPattern.test(raw)) {
+            event.currentTarget.value = lastValidValue.current;
+            showError(event.currentTarget);
+            return;
+          }
+          lastValidValue.current = raw;
+          const boundsMessage = rangeError(raw);
+          if (boundsMessage) showError(event.currentTarget, boundsMessage);
+          else clearError(event.currentTarget);
+          onChange?.(event);
+        }}
+        onBlur={(event) => {
+          const raw = event.currentTarget.value;
+          const boundsMessage = rangeError(raw);
+          if (raw && !completePattern.test(raw))
+            showError(event.currentTarget, formatError);
+          else if (boundsMessage) showError(event.currentTarget, boundsMessage);
+          else clearError(event.currentTarget);
+          onBlur?.(event);
+        }}
+        onInvalid={(event) => {
+          event.preventDefault();
+          const element = event.currentTarget;
+          const message =
+            element.validity.valueMissing
+              ? "This numeric field is required."
+              : rangeError(element.value) || formatError;
+          showError(element, message);
+          onInvalid?.(event);
+        }}
+      />
+      {validationError && !hideValidationMessage && (
+        <small className="numeric-input-error" role="alert">
+          {validationError}
+        </small>
+      )}
+    </>
+  );
 }
 
 function DeliveryButton({ sale, reload }: { sale: O; reload: () => void }) {
@@ -141,7 +301,120 @@ function ShopTitle() {
   }, []);
   return <span data-no-translate>{name}</span>;
 }
-function SettingsWithPreferences() {
+function CategoryManagement() {
+  const [categories, setCategories] = useState<O[]>([]);
+  const [message, setMessage] = useState("");
+  const [open, setOpen] = useState(false);
+  const load = () =>
+    api("/categories")
+      .then(setCategories)
+      .catch((error) => setMessage(error.message));
+  useEffect(load, []);
+  const remove = async (category: O) => {
+    if (!confirm(`Delete “${category.name}”? Referenced categories will be archived instead.`))
+      return;
+    try {
+      const result = await api("/categories/" + category.id, {
+        method: "DELETE",
+      });
+      setMessage(
+        result.archived
+          ? `Category archived because ${result.referencedProducts} product(s) still use it. Reassign those products before permanent deletion.`
+          : "Category deleted successfully.",
+      );
+      void load();
+    } catch (error: any) {
+      setMessage(error.message);
+    }
+  };
+  return (
+    <section className="category-management">
+      <button
+        type="button"
+        className="category-management-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>Category Management</span>
+        <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="category-management-content">
+          <form
+            className="inline category-create-form"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              const form = event.currentTarget;
+              const name = String(new FormData(form).get("name") || "").trim();
+              try {
+                await api("/categories", {
+                  method: "POST",
+                  body: JSON.stringify({ name }),
+                });
+                form.reset();
+                setMessage("Category created successfully.");
+                void load();
+              } catch (error: any) {
+                setMessage(error.message);
+              }
+            }}
+          >
+            <label>
+              Category name
+              <input name="name" required />
+            </label>
+            <button className="form-submit">Create category</button>
+          </form>
+          {message && <p>{message}</p>}
+          <T
+            rows={categories}
+            cols={[
+              ["Category", (category) => category.name],
+              ["Products", (category) => category.product_count],
+              ["Status", (category) => category.is_active ? "Active" : "Inactive"],
+              [
+                "Manage",
+                (category) => (
+                  <form
+                    className="category-row-editor"
+                    onSubmit={async (event) => {
+                      event.preventDefault();
+                      const name = String(
+                        new FormData(event.currentTarget).get("name") || "",
+                      ).trim();
+                      try {
+                        await api("/categories/" + category.id, {
+                          method: "PATCH",
+                          body: JSON.stringify({ name }),
+                        });
+                        setMessage("Category renamed successfully.");
+                        void load();
+                      } catch (error: any) {
+                        setMessage(error.message);
+                      }
+                    }}
+                  >
+                    <input
+                      name="name"
+                      defaultValue={category.name}
+                      aria-label={`Rename ${category.name}`}
+                      required
+                    />
+                    <button>Save</button>
+                    <button type="button" onClick={() => remove(category)}>
+                      Delete / archive
+                    </button>
+                  </form>
+                ),
+              ],
+            ]}
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+function SettingsWithPreferences({ admin }: { admin: boolean }) {
   const [shopName, setShopName] = useState(readShopName()),
     [theme, setTheme] = useState(localStorage.getItem("theme") || "White"),
     [language, setLanguage] = useState<AppLanguage>(readLanguage()),
@@ -256,6 +529,7 @@ function SettingsWithPreferences() {
           {message}
         </p>
       )}
+      {admin && <CategoryManagement />}
     </>
   );
 }
@@ -285,13 +559,15 @@ function ReportsWithPeriods() {
       </label>
       <section className="cards report-cards">
         {[
-          ["Total earnings", gel(m.revenue)],
+          ["Total Revenue", gel(m.revenue)],
           ["Imported product cost", gel(m.importCost)],
           ["Financial loss", gel(m.lossAmount)],
           ["Returned products", m.returnedQuantity],
           ["Returned / refunded", gel(m.refundedAmount)],
           ["In transit", m.inTransit],
           ["Paid / closed sales", m.paidClosedSales],
+          ["Reserved products", m.reservedProducts],
+          ["Reserved products total", gel(m.reservedProductsTotal)],
           [
             "Most returned product",
             r.mostReturnedProduct
@@ -311,13 +587,13 @@ function ReportsWithPeriods() {
           </div>
         ))}
       </section>
-      <h3>Supplier earnings</h3>
+      <h3>Supplier Revenue</h3>
       <T
         rows={r.supplierEarnings}
         cols={[
           ["Supplier", (x) => x.supplier_name],
           ["Products sold", (x) => x.quantity],
-          ["Earnings", (x) => gel(x.revenue)],
+          ["Revenue", (x) => gel(x.revenue)],
         ]}
       />
     </>
@@ -327,18 +603,39 @@ function InventoryWithSummary() {
   const [summary, setSummary] = useState<O>(),
     [products, setProducts] = useState<O[]>([]),
     [suppliers, setSuppliers] = useState<O[]>([]),
-    [moves, setMoves] = useState<O[]>([]),
-    [filters, setFilters] = useState<O>({});
-  const load = () => {
-    api("/inventory/summary").then(setSummary);
-    api("/products").then(setProducts);
-    api("/suppliers").then(setSuppliers);
+    [inventoryRows, setInventoryRows] = useState<O[]>([]),
+    [actionRows, setActionRows] = useState<O[]>([]),
+    [filters, setFilters] = useState<O>({}),
+    [errorMessage, setErrorMessage] = useState("");
+  const loadPage = () => {
+    Promise.all([
+      api("/inventory/summary"),
+      api("/products"),
+      api("/suppliers"),
+      api("/inventory/movements"),
+    ])
+      .then(([nextSummary, productRows, supplierRows, movementRows]) => {
+        setSummary(nextSummary);
+        setProducts(productRows);
+        setSuppliers(supplierRows);
+        setActionRows(movementRows);
+      })
+      .catch((error) => setErrorMessage(error.message));
+  };
+  const loadInventoryTable = () => {
     const q = new URLSearchParams(
       Object.entries(filters).filter(([, v]) => v) as [string, string][],
     ).toString();
-    api("/inventory/movements?" + q).then(setMoves);
+    api("/inventory/products?" + q)
+      .then(setInventoryRows)
+      .catch((error) => setErrorMessage(error.message));
   };
-  useEffect(load, [JSON.stringify(filters)]);
+  const reload = () => {
+    loadPage();
+    loadInventoryTable();
+  };
+  useEffect(loadPage, []);
+  useEffect(loadInventoryTable, [JSON.stringify(filters)]);
   return (
     <>
       <h2>Inventory</h2>
@@ -433,8 +730,217 @@ function InventoryWithSummary() {
           />
         </label>
       </form>
-      <Inventory showTitle={false} showHistory={false} onChanged={load} />
-      <MovementTable rows={moves} reload={load} allowDelete />
+      {errorMessage && <p className="error">{errorMessage}</p>}
+      <h3>Inventory records</h3>
+      <T
+        rows={inventoryRows}
+        cols={[
+          [
+            "ID",
+            (row, index) => (
+              <Link className="inventory-id-link" to={`/inventory/${row.id}`}>
+                {index}
+              </Link>
+            ),
+          ],
+          ["Supplier", (row) => row.supplier_name || "—"],
+          ["Product", (row) => row.product_name],
+          ["Quantity", (row) => row.quantity],
+          [
+            "Purchase Cost",
+            (row) =>
+              row.stored_purchase_cost == null
+                ? "—"
+                : gel(row.stored_purchase_cost),
+          ],
+          ["Notes", (row) => <NoteButton note={row.notes} label="View" />],
+        ]}
+      />
+      <Inventory showTitle={false} showHistory={false} onChanged={reload} />
+      <h3>Inventory actions</h3>
+      <MovementTable
+        rows={actionRows}
+        reload={reload}
+        allowDelete
+        showEmployee={false}
+      />
+    </>
+  );
+}
+function InventoryDetail({ admin }: { admin: boolean }) {
+  const { id: productId } = useParams();
+  const [product, setProduct] = useState<O>();
+  const [categories, setCategories] = useState<O[]>([]);
+  const [suppliers, setSuppliers] = useState<O[]>([]);
+  const [activity, setActivity] = useState<O[]>([]);
+  const [message, setMessage] = useState("");
+  const load = () => {
+    if (!productId) return;
+    return Promise.all([
+      api("/products/" + productId),
+      api("/categories"),
+      api("/suppliers"),
+      api("/inventory/products/" + productId + "/activity"),
+    ])
+      .then(([details, categoryRows, supplierRows, activityRows]) => {
+        setProduct(details);
+        setCategories(categoryRows);
+        setSuppliers(supplierRows);
+        setActivity(activityRows);
+      })
+      .catch((error) => setMessage(error.message));
+  };
+  useEffect(load, [productId]);
+  return (
+    <>
+      <h2>Inventory details</h2>
+      {message && (
+        <p className={message.includes("success") ? "" : "error"}>
+          {message}
+        </p>
+      )}
+      {!product && !message && <p>Loading…</p>}
+      {product && (
+        <form
+          className="inventory-detail-form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            if (!admin || !productId) return;
+            const values = new FormData(event.currentTarget);
+            try {
+              const updated = await api("/products/" + productId, {
+                method: "PATCH",
+                body: JSON.stringify({
+                  name: values.get("name"),
+                  categoryId: values.get("categoryId"),
+                  supplierId: values.get("supplierId"),
+                  width: values.get("width") ? +values.get("width")! : null,
+                  height: values.get("height") ? +values.get("height")! : null,
+                  depth: values.get("depth") ? +values.get("depth")! : null,
+                  material: values.get("material") || null,
+                  color: values.get("color") || null,
+                  purchasePrice: +values.get("purchasePrice")!,
+                  sellingPrice: +values.get("sellingPrice")!,
+                  description: values.get("notes") || null,
+                }),
+              });
+              setProduct({ ...product, ...updated });
+              await load();
+              setMessage("Inventory details saved successfully.");
+            } catch (error: any) {
+              setMessage(error.message);
+            }
+          }}
+        >
+          <label>
+            Product name
+            <input name="name" defaultValue={product.name} disabled={!admin} required />
+          </label>
+          <label>
+            Category
+            <select
+              name="categoryId"
+              defaultValue={product.category_id || ""}
+              disabled={!admin}
+              required
+            >
+              <option value="" disabled>Select category</option>
+              {categories
+                .filter(
+                  (category) =>
+                    category.is_active || category.id === product.category_id,
+                )
+                .map((category) => (
+                  <option key={category.id} value={category.id}>
+                    {category.name}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label>
+            Supplier
+            <select
+              name="supplierId"
+              defaultValue={product.supplier_id || ""}
+              disabled={!admin}
+              required
+            >
+              <option value="" disabled>Select supplier</option>
+              {suppliers.map((supplier) => (
+                <option key={supplier.id} value={supplier.id}>
+                  {supplier.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          {[["width", "Width"], ["height", "Height"], ["depth", "Depth"]].map(
+            ([name, label]) => (
+              <label key={name}>
+                {label}
+                <NumericInput
+                  name={name}
+                  min="0"
+                  defaultValue={product[name] ?? ""}
+                  disabled={!admin}
+                />
+              </label>
+            ),
+          )}
+          <label>
+            Material
+            <input name="material" defaultValue={product.material || ""} disabled={!admin} />
+          </label>
+          <label>
+            Color
+            <input name="color" defaultValue={product.color || ""} disabled={!admin} />
+          </label>
+          <label>
+            Purchase cost
+            <NumericInput name="purchasePrice" min="0" defaultValue={product.purchase_price} disabled={!admin} required />
+          </label>
+          <label>
+            Selling price
+            <NumericInput name="sellingPrice" min="0" defaultValue={product.selling_price} disabled={!admin} required />
+          </label>
+          <label>
+            Current quantity
+            <input value={product.current_quantity} readOnly />
+          </label>
+          <label>
+            Reserved quantity
+            <input value={product.reserved_quantity} readOnly />
+          </label>
+          <label>
+            Last imported date
+            <input value={product.last_import_date ? dt(product.last_import_date) : ""} readOnly />
+          </label>
+          <label>
+            Last sale date
+            <input value={product.last_sale_date ? dt(product.last_sale_date) : ""} readOnly />
+          </label>
+          <label className="inventory-detail-notes">
+            Notes
+            <textarea name="notes" defaultValue={product.description || ""} disabled={!admin} />
+          </label>
+          {admin && <button className="form-submit">Save</button>}
+        </form>
+      )}
+      <h3>Product activity</h3>
+      <T
+        rows={activity}
+        cols={[
+          ["Date", (row) => dt(row.occurred_at)],
+          ["Type", (row) => <StatusValue value={row.type} />],
+          ["Status", (row) => row.status || "—"],
+          ["Quantity", (row) => row.quantity ?? "—"],
+          ["Price", (row) => row.price == null ? "—" : gel(row.price)],
+          ["Customer", (row) => row.customer_name || "—"],
+          ["Supplier", (row) => row.supplier_name || "—"],
+          ["Sale ID", (row) => row.sale_number || "—"],
+          ["Changes", (row) => <ChangeButton activity={row} />],
+          ["Notes", (row) => <NoteButton note={row.notes} label="View" />],
+        ]}
+      />
     </>
   );
 }
@@ -453,10 +959,10 @@ function Deliveries() {
       <label className="page-filter">
         Status
         <select value={status} onChange={(e) => setStatus(e.target.value)}>
-          <option>ALL</option>
-          <option>READY</option>
-          <option>IN_TRANSIT</option>
-          <option>DELIVERED</option>
+          <option value="ALL">All</option>
+          <option value="READY">READY</option>
+          <option value="IN_TRANSIT">IN_TRANSIT</option>
+          <option value="DELIVERED">Delivered</option>
         </select>
       </label>
       {e && <p className="error">{e}</p>}
@@ -521,7 +1027,12 @@ function Payments() {
           ["Remaining", (x) => gel(x.remaining)],
           ["Payment Status", (x) => x.payment_status],
           ["Date", (x) => dt(x.business_date)],
-          ["Action", (x) => <PaidEditor sale={x} reload={load} />],
+          [
+            "Action",
+            (x) => (
+              <PaidEditor sale={x} reload={load} hideValidationMessage />
+            ),
+          ],
         ]}
       />
     </>
@@ -529,13 +1040,27 @@ function Payments() {
 }
 function SalesWithBusinessDate() {
   const [p, sp] = useState<O[]>([]),
+    [customers, setCustomers] = useState<O[]>([]),
     [r, sr] = useState<O[]>([]),
-    [e, se] = useState("");
+    [e, se] = useState(""),
+    [productId, setProductId] = useState(""),
+    [quantity, setQuantity] = useState("1"),
+    [discount, setDiscount] = useState("0");
   const load = () => {
-    api("/products").then(sp);
-    api("/sales").then(sr);
+    Promise.all([api("/products"), api("/customers"), api("/sales")])
+      .then(([products, customerRows, sales]) => {
+        sp(products);
+        setCustomers(customerRows);
+        sr(sales);
+      })
+      .catch((x) => se(x.message));
   };
   useEffect(load, []);
+  const product = p.find((item) => item.id === productId);
+  const regularPrice = +(product?.selling_price || 0);
+  const discountAmount = +discount || 0;
+  const finalPrice = Math.max(0, regularPrice - discountAmount);
+  const saleTotal = finalPrice * (+quantity || 0);
   return (
     <>
       <h2>Sales</h2>
@@ -549,11 +1074,12 @@ function SalesWithBusinessDate() {
               method: "POST",
               body: JSON.stringify({
                 businessDate: f.get("businessDate"),
+                customerId: f.get("customerId") || null,
                 items: [
                   {
                     productId: f.get("productId"),
                     quantity: +f.get("quantity")!,
-                    finalUnitPrice: +f.get("price")!,
+                    discountAmount: +f.get("discount")!,
                   },
                 ],
                 payments: f.get("paid")
@@ -563,6 +1089,9 @@ function SalesWithBusinessDate() {
               }),
             });
             form.reset();
+            setProductId("");
+            setQuantity("1");
+            setDiscount("0");
             load();
           } catch (z: any) {
             se(z.message);
@@ -579,8 +1108,27 @@ function SalesWithBusinessDate() {
           />
         </label>
         <label>
+          Customer
+          <select name="customerId">
+            <option value="">Walk-in customer</option>
+            {customers.map((customer) => (
+              <option key={customer.id} value={customer.id}>
+                {customer.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
           Product
-          <select name="productId" required>
+          <select
+            name="productId"
+            value={productId}
+            onChange={(event) => {
+              setProductId(event.target.value);
+              setDiscount("0");
+            }}
+            required
+          >
             <option value="">Product</option>
             {p
               .filter((x) => x.available_quantity > 0)
@@ -593,12 +1141,34 @@ function SalesWithBusinessDate() {
         </label>
         <label className="quantity-field">
           Quantity
-          <input name="quantity" type="number" min="1" defaultValue="1" />
+          <NumericInput
+            name="quantity"
+            integer
+            min="1"
+            value={quantity}
+            onChange={(event) => setQuantity(event.target.value)}
+            required
+          />
         </label>
         <label>
-          Final unit price
-          <input name="price" type="number" min="0" step="0.01" required />
+          Regular unit price
+          <input value={regularPrice} readOnly disabled />
         </label>
+        <label>
+          Customer discount per unit
+          <NumericInput
+            name="discount"
+            min="0"
+            max={regularPrice}
+            value={discount}
+            onChange={(event) => setDiscount(event.target.value)}
+            required
+          />
+        </label>
+        <p className="form-calculation">
+          Final unit price: <b>{gel(finalPrice)}</b><br />
+          Sale total: <b>{gel(saleTotal)}</b>
+        </p>
         <label>
           Payment method
           <select name="method">
@@ -610,7 +1180,11 @@ function SalesWithBusinessDate() {
         </label>
         <label>
           Paid now
-          <input name="paid" type="number" min="0" step="0.01" />
+          <NumericInput
+            name="paid"
+            min="0"
+            hideValidationMessage
+          />
         </label>
         <label>
           Notes
@@ -624,6 +1198,7 @@ function SalesWithBusinessDate() {
         cols={[
           ["Sale #", (x) => x.sale_number],
           ["Sale date", (x) => dt(x.business_date || x.created_at)],
+          ["Customer", (x) => x.customer_name || "Walk-in customer"],
           [
             "Product",
             (x) =>
@@ -639,8 +1214,14 @@ function SalesWithBusinessDate() {
                 .join(", "),
           ],
           ["Selling price", (x) => gel(x.total)],
+          ["Discount", (x) => gel(x.discount_total)],
           ["Total", (x) => gel(x.total)],
-          ["Paid", (x) => <PaidEditor sale={x} reload={load} />],
+          [
+            "Paid",
+            (x) => (
+              <PaidEditor sale={x} reload={load} hideValidationMessage />
+            ),
+          ],
           ["Remaining", (x) => gel(x.remaining)],
           [
             "Status",
@@ -730,22 +1311,43 @@ const dt = (v: any) =>
         timeZone: "Asia/Tbilisi",
       }).format(new Date(v))
     : "—";
-const today = () => {
+const dtt = (v: any) =>
+  v
+    ? new Intl.DateTimeFormat("en-GB", {
+        day: "2-digit",
+        month: "2-digit",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+        timeZone: "Asia/Tbilisi",
+      }).format(new Date(v))
+    : "—";
+const today = (date: Date | string | number = new Date()) => {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Tbilisi",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).formatToParts(new Date());
+  }).formatToParts(new Date(date));
   const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${value.year}-${value.month}-${value.day}`;
 };
-function T({ rows, cols }: { rows: O[]; cols: [string, (x: O) => any][] }) {
+const reservationExpiryIso = (value: FormDataEntryValue | null) =>
+  value
+    ? new Date(`${String(value)}T23:59:59.999+04:00`).toISOString()
+    : null;
+function T({
+  rows,
+  cols,
+}: {
+  rows: O[];
+  cols: [string, (x: O, index: number) => any][];
+}) {
   const [sort, setSort] = useState<{ index: number; direction: 1 | -1 } | null>(
     null,
   );
   const value = (row: O, index: number) => {
-    const v = cols[index][1](row);
+    const v = cols[index][1](row, 0);
     return typeof v === "number"
       ? v
       : typeof v === "string"
@@ -792,7 +1394,7 @@ function T({ rows, cols }: { rows: O[]; cols: [string, (x: O) => any][] }) {
           {sorted.map((x, i) => (
             <tr key={x.id || i}>
               {cols.map((c) => (
-                <td key={c[0]}>{c[1](x)}</td>
+                <td key={c[0]}>{c[1](x, i)}</td>
               ))}
             </tr>
           ))}
@@ -806,19 +1408,175 @@ function T({ rows, cols }: { rows: O[]; cols: [string, (x: O) => any][] }) {
     </div>
   );
 }
-function NoteButton({ note }: { note?: string | null }) {
+function NoteButton({
+  note,
+  label = "View",
+}: {
+  note?: string | null;
+  label?: string;
+}) {
   const [open, setOpen] = useState(false);
   if (!note) return <>—</>;
   return (
     <>
       <button className="note-button" onClick={() => setOpen(true)}>
-        View note
+        {label}
       </button>
       {open && (
         <div className="modal-backdrop" onClick={() => setOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
             <h3>Note</h3>
             <p>{note}</p>
+            <button onClick={() => setOpen(false)}>Close</button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+const historyLabel = (value: string) =>
+  value
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/_/g, " ")
+    .replace(/^./, (letter) => letter.toUpperCase());
+const historyValue = (value: any): string => {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (Array.isArray(value)) return value.map(historyValue).join(", ");
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
+};
+function HistoryDetailsButton({ row }: { row: O }) {
+  const [open, setOpen] = useState(false);
+  const details: [string, string][] = [
+    ["Date and time", dtt(row.created_at)],
+    ["Action", row.type || "—"],
+    ["Status", row.status || "—"],
+    ["Product", row.product_name || "—"],
+    [
+      "Quantity",
+      row.quantity == null
+        ? "—"
+        : `${row.quantity > 0 ? "+" : ""}${row.quantity}`,
+    ],
+    [
+      "Purchase cost",
+      row.purchase_price == null ? "—" : gel(row.purchase_price),
+    ],
+    [
+      "Selling price",
+      row.sale_selling_price == null ? "—" : gel(row.sale_selling_price),
+    ],
+    ["Supplier", row.supplier_name || "—"],
+    ["Customer", row.customer_name || "—"],
+    ["Employee", row.employee_name || "—"],
+    ["Sale ID", row.sale_number == null ? "—" : String(row.sale_number)],
+  ];
+  if (row.entity_type)
+    details.push(["Record type", historyLabel(row.entity_type)]);
+  if (row.target_name || row.audit_details?.name)
+    details.push([
+      "Record",
+      historyValue(row.target_name || row.audit_details?.name),
+    ]);
+  if (row.field_name) details.push(["Field changed", row.field_name]);
+  if (row.old_value != null) details.push(["Old value", row.old_value]);
+  if (row.new_value != null) details.push(["New value", row.new_value]);
+  if (row.deleted_by_name)
+    details.push(["Reversed by", row.deleted_by_name]);
+  if (row.deletion_reason)
+    details.push(["Reversal reason", row.deletion_reason]);
+  if (row.notes) details.push(["Notes", row.notes]);
+  const auditDetails = row.audit_details || {};
+  Object.entries(auditDetails).forEach(([key, value]) => {
+    if (key === "changes" && value && typeof value === "object") {
+      Object.entries(value as O).forEach(([field, change]: [string, any]) => {
+        details.push([
+          `${historyLabel(field)}: old value`,
+          historyValue(change?.oldValue),
+        ]);
+        details.push([
+          `${historyLabel(field)}: new value`,
+          historyValue(change?.newValue),
+        ]);
+      });
+      return;
+    }
+    if (key === "notes" && row.notes === value) return;
+    details.push([historyLabel(key), historyValue(value)]);
+  });
+  return (
+    <>
+      <button className="note-button" type="button" onClick={() => setOpen(true)}>
+        View
+      </button>
+      {open && (
+        <div className="modal-backdrop" onClick={() => setOpen(false)}>
+          <div
+            className="modal history-details-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>History details</h3>
+            <dl className="change-details">
+              {details.map(([label, value], index) => (
+                <div key={`${label}-${index}`}>
+                  <dt>{label}</dt>
+                  <dd>{value}</dd>
+                </div>
+              ))}
+            </dl>
+            <button type="button" onClick={() => setOpen(false)}>
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+function ChangeButton({ activity }: { activity: O }) {
+  const [open, setOpen] = useState(false);
+  const isChange =
+    activity.status === "CHANGED" ||
+    activity.type === "CHANGED" ||
+    String(activity.type || "").endsWith("_CHANGED");
+  if (!isChange) return <>—</>;
+  const title = String(activity.type || activity.field_name || "Changed")
+    .toLowerCase()
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+  return (
+    <>
+      <button className="note-button" onClick={() => setOpen(true)}>
+        Changes
+      </button>
+      {open && (
+        <div className="modal-backdrop" onClick={() => setOpen(false)}>
+          <div className="modal change-modal" onClick={(event) => event.stopPropagation()}>
+            <h3>{title}</h3>
+            <dl className="change-details">
+              <div>
+                <dt>Field changed</dt>
+                <dd>{activity.field_name || "—"}</dd>
+              </div>
+              <div>
+                <dt>Old value</dt>
+                <dd>{activity.old_value ?? "—"}</dd>
+              </div>
+              <div>
+                <dt>New value</dt>
+                <dd>{activity.new_value ?? "—"}</dd>
+              </div>
+              <div>
+                <dt>Changed by</dt>
+                <dd>{activity.user_name || "—"}</dd>
+              </div>
+              <div>
+                <dt>Date</dt>
+                <dd>{dt(activity.occurred_at)}</dd>
+              </div>
+            </dl>
             <button onClick={() => setOpen(false)}>Close</button>
           </div>
         </div>
@@ -886,6 +1644,7 @@ function Dashboard() {
     ["Products", d.products],
     ["Available", d.available],
     ["Reserved", d.reserved],
+    ["Reserved products total", gel(d.reserved_total)],
     ["Out of stock", d.out_stock],
     ["Today", gel(d.today_revenue)],
     ["Month", gel(d.month_revenue)],
@@ -921,13 +1680,276 @@ function Dashboard() {
     </>
   );
 }
+// Backend image support remains enabled; flip this flag when the image UI is ready.
+const productImageUiEnabled = false;
+function ProductDetails({
+  productId,
+  admin,
+  close,
+  reload,
+}: {
+  productId: string;
+  admin: boolean;
+  close: () => void;
+  reload: () => void;
+}) {
+  const [product, setProduct] = useState<O>();
+  const [categories, setCategories] = useState<O[]>([]);
+  const [suppliers, setSuppliers] = useState<O[]>([]);
+  const [message, setMessage] = useState("");
+  const load = () =>
+    Promise.all([
+      api("/products/" + productId),
+      api("/categories"),
+      api("/suppliers"),
+    ])
+      .then(([details, categoryRows, supplierRows]) => {
+        setProduct(details);
+        setCategories(categoryRows);
+        setSuppliers(supplierRows);
+      })
+      .catch((error) => setMessage(error.message));
+  useEffect(load, [productId]);
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [close]);
+  const removeImage = async (imageId: string) => {
+    try {
+      await api("/product-images/" + imageId, { method: "DELETE" });
+      await load();
+      reload();
+    } catch (error: any) {
+      setMessage(error.message);
+    }
+  };
+  const makePrimary = async (imageId: string) => {
+    try {
+      await api("/product-images/" + imageId + "/primary", {
+        method: "POST",
+      });
+      await load();
+      reload();
+    } catch (error: any) {
+      setMessage(error.message);
+    }
+  };
+  return (
+    <div className="modal-backdrop" onClick={close}>
+      <div
+        className="modal product-details-modal"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="modal-heading">
+          <h3>Product details</h3>
+          <button className="mobile-modal-close" type="button" onClick={close}>
+            Close
+          </button>
+        </div>
+        {!product && !message && <p>Loading…</p>}
+        {message && <p className="error">{message}</p>}
+        {product && (
+          <>
+            <section className="cards product-detail-cards">
+              {[
+                ["Physical Stock", product.current_quantity],
+                ["Reserved", product.reserved_quantity],
+                ["Available", product.available_quantity],
+              ].map(([label, value]) => (
+                <div className="card" key={String(label)}>
+                  <small>{label}</small>
+                  <strong>{value}</strong>
+                </div>
+              ))}
+            </section>
+            <form
+              className="product-details-form"
+              onSubmit={async (event) => {
+                event.preventDefault();
+                const values = new FormData(event.currentTarget);
+                try {
+                  const updated = await api("/products/" + productId, {
+                    method: "PATCH",
+                    body: JSON.stringify({
+                      name: values.get("name"),
+                      categoryId: values.get("categoryId") || null,
+                      supplierId: values.get("supplierId") || null,
+                      description: values.get("description") || null,
+                      purchasePrice: +values.get("purchasePrice")!,
+                      sellingPrice: +values.get("sellingPrice")!,
+                      width: values.get("width") ? +values.get("width")! : null,
+                      height: values.get("height") ? +values.get("height")! : null,
+                      depth: values.get("depth") ? +values.get("depth")! : null,
+                      material: values.get("material") || null,
+                      color: values.get("color") || null,
+                      isActive: values.get("isActive") === "on",
+                    }),
+                  });
+                  setProduct({ ...product, ...updated });
+                  setMessage("Product details saved successfully.");
+                  reload();
+                } catch (error: any) {
+                  setMessage(error.message);
+                }
+              }}
+            >
+              <label>
+                Product name
+                <input name="name" defaultValue={product.name} required disabled={!admin} />
+              </label>
+              <label>
+                Category
+                <select
+                  name="categoryId"
+                  defaultValue={product.category_id || ""}
+                  disabled={!admin}
+                  required
+                >
+                  <option value="" disabled>Select category</option>
+                  {categories
+                    .filter(
+                      (category) =>
+                        category.is_active || category.id === product.category_id,
+                    )
+                    .map((category) => (
+                      <option key={category.id} value={category.id}>
+                        {category.name}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <label>
+                Supplier
+                <select
+                  name="supplierId"
+                  defaultValue={product.supplier_id || ""}
+                  disabled={!admin}
+                  required
+                >
+                  <option value="" disabled>Select supplier</option>
+                  {suppliers.map((supplier) => (
+                    <option key={supplier.id} value={supplier.id}>{supplier.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Purchase cost
+                <NumericInput name="purchasePrice" min="0" defaultValue={product.purchase_price} required disabled={!admin} />
+              </label>
+              <label>
+                Selling price
+                <NumericInput name="sellingPrice" min="0" defaultValue={product.selling_price} required disabled={!admin} />
+              </label>
+              {[["width", "Width"], ["height", "Height"], ["depth", "Depth"]].map(([name, label]) => (
+                <label key={name}>
+                  {label}
+                  <NumericInput name={name} min="0" defaultValue={product[name] ?? ""} disabled={!admin} />
+                </label>
+              ))}
+              <label>
+                Material
+                <input name="material" defaultValue={product.material || ""} disabled={!admin} />
+              </label>
+              <label>
+                Color
+                <input name="color" defaultValue={product.color || ""} disabled={!admin} />
+              </label>
+              <label className="details-description">
+                Description
+                <textarea name="description" defaultValue={product.description || ""} disabled={!admin} />
+              </label>
+              {admin && (
+                <label className="checkbox-label">
+                  <input
+                    name="isActive"
+                    type="checkbox"
+                    defaultChecked={product.is_active}
+                    disabled={product.has_history && !product.is_active}
+                  />
+                  {product.has_history && !product.is_active
+                    ? "Archived product (history retained)"
+                    : "Active product"}
+                </label>
+              )}
+              {admin && <button className="form-submit">Save details</button>}
+            </form>
+            {productImageUiEnabled && (
+              <>
+                <h3>Product images</h3>
+                <div className="product-gallery">
+                  {(product.images || []).map((image: O) => (
+                    <figure key={image.id}>
+                      <img src={"/uploads/" + image.storage_path} alt={product.name} />
+                      <figcaption>{image.is_primary ? "Primary image" : image.filename}</figcaption>
+                      {admin && (
+                        <div className="toolbar">
+                          {!image.is_primary && <button type="button" onClick={() => makePrimary(image.id)}>Make primary</button>}
+                          <button type="button" onClick={() => removeImage(image.id)}>Delete image</button>
+                        </div>
+                      )}
+                    </figure>
+                  ))}
+                  {!product.images?.length && <p>No product images.</p>}
+                </div>
+                {admin && (
+                  <label className="image-upload">
+                    Add image (JPG, PNG or WebP; maximum 5)
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp"
+                      disabled={(product.images || []).length >= 5}
+                      onChange={async (event) => {
+                        const file = event.target.files?.[0];
+                        if (!file) return;
+                        const body = new FormData();
+                        body.append("image", file);
+                        try {
+                          await api("/products/" + productId + "/images", { method: "POST", body });
+                          event.target.value = "";
+                          await load();
+                          reload();
+                        } catch (error: any) {
+                          setMessage(error.message);
+                        }
+                      }}
+                    />
+                  </label>
+                )}
+              </>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
 function Products({ admin }: { admin: boolean }) {
   const [r, sr] = useState<O[]>([]),
-    [e, se] = useState("");
-  const load = () =>
-    api("/products?status=all")
-      .then(sr)
+    [e, se] = useState(""),
+    [selectedProductId, setSelectedProductId] = useState<string>(),
+    [categories, setCategories] = useState<O[]>([]),
+    [suppliers, setSuppliers] = useState<O[]>([]),
+    [filters, setFilters] = useState({
+      categoryId: "",
+      supplierId: "",
+      minPrice: "",
+      maxPrice: "",
+    });
+  const load = () => {
+    const query = new URLSearchParams({ status: "all" });
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value) query.set(key, value);
+    });
+    return api("/products?" + query)
+      .then((rows) => {
+        sr(rows);
+        se("");
+      })
       .catch((x) => se(x.message));
+  };
   const remove = async (product: O) => {
     if (
       !confirm(
@@ -947,7 +1969,15 @@ function Products({ admin }: { admin: boolean }) {
       se(x.message);
     }
   };
-  useEffect(load, []);
+  useEffect(() => {
+    Promise.all([api("/categories"), api("/suppliers")])
+      .then(([categoryRows, supplierRows]) => {
+        setCategories(categoryRows);
+        setSuppliers(supplierRows);
+      })
+      .catch((error) => se(error.message));
+  }, []);
+  useEffect(load, [JSON.stringify(filters)]);
   return (
     <>
       <h2>Products</h2>
@@ -963,6 +1993,8 @@ function Products({ admin }: { admin: boolean }) {
                 method: "POST",
                 body: JSON.stringify({
                   name: f.get("name"),
+                  categoryId: f.get("categoryId"),
+                  supplierId: f.get("supplierId"),
                   sellingPrice: +f.get("price")!,
                   purchasePrice: +f.get("cost")!,
                 }),
@@ -979,28 +2011,137 @@ function Products({ admin }: { admin: boolean }) {
             <input name="name" required />
           </label>
           <label>
+            Category
+            <select name="categoryId" defaultValue="" required>
+              <option value="" disabled>Select category</option>
+              {categories
+                .filter((category) => category.is_active)
+                .map((category) => (
+                  <option key={category.id} value={category.id}>
+                    {category.name}
+                  </option>
+                ))}
+            </select>
+          </label>
+          <label>
+            Supplier
+            <select name="supplierId" defaultValue="" required>
+              <option value="" disabled>Select supplier</option>
+              {suppliers.map((supplier) => (
+                <option key={supplier.id} value={supplier.id}>
+                  {supplier.name}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
             Selling price
-            <input name="price" type="number" min="0" required />
+            <NumericInput name="price" min="0" required />
           </label>
           <label>
             Purchase cost
-            <input
+            <NumericInput
               name="cost"
-              type="number"
               min="0"
-              step="1"
               defaultValue="0"
             />
           </label>
           <button className="form-submit">Add product</button>
         </form>
       )}
+      <form className="product-filters" onSubmit={(event) => event.preventDefault()}>
+        <label>
+          Category
+          <select
+            value={filters.categoryId}
+            onChange={(event) =>
+              setFilters({ ...filters, categoryId: event.target.value })
+            }
+          >
+            <option value="">All</option>
+            {categories.map((category) => (
+              <option key={category.id} value={category.id}>
+                {category.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Supplier
+          <select
+            value={filters.supplierId}
+            onChange={(event) =>
+              setFilters({ ...filters, supplierId: event.target.value })
+            }
+          >
+            <option value="">All</option>
+            {suppliers.map((supplier) => (
+              <option key={supplier.id} value={supplier.id}>
+                {supplier.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Minimum price
+          <NumericInput
+            min="0"
+            value={filters.minPrice}
+            onChange={(event) =>
+              setFilters({ ...filters, minPrice: event.target.value })
+            }
+          />
+        </label>
+        <label>
+          Maximum price
+          <NumericInput
+            min="0"
+            value={filters.maxPrice}
+            onChange={(event) =>
+              setFilters({ ...filters, maxPrice: event.target.value })
+            }
+          />
+        </label>
+        <button
+          type="button"
+          onClick={() =>
+            setFilters({
+              categoryId: "",
+              supplierId: "",
+              minPrice: "",
+              maxPrice: "",
+            })
+          }
+        >
+          Clear filters
+        </button>
+      </form>
       {e && <p className="error">{e}</p>}
+      {selectedProductId && (
+        <ProductDetails
+          productId={selectedProductId}
+          admin={admin}
+          close={() => setSelectedProductId(undefined)}
+          reload={load}
+        />
+      )}
       <T
         rows={r}
         cols={[
+          [
+            "ID",
+            (product, index) => (
+              <Link
+                className="inventory-id-link"
+                to={`/inventory/${product.id}`}
+              >
+                {index}
+              </Link>
+            ),
+          ],
           ["Name", (x) => x.name],
           ["Category", (x) => x.category_name || "—"],
+          ["Supplier", (x) => x.supplier_name || "—"],
           ["In stock", (x) => x.current_quantity],
           ["Reserved", (x) => x.reserved_quantity],
           ["Available now", (x) => x.available_quantity],
@@ -1010,13 +2151,14 @@ function Products({ admin }: { admin: boolean }) {
           [
             "Action",
             (x) =>
-              admin ? (
-                <button onClick={() => remove(x)}>
-                  {x.is_active ? "Delete / archive" : "Delete"}
-                </button>
-              ) : (
-                "—"
-              ),
+              <div className="toolbar">
+                <button onClick={() => setSelectedProductId(x.id)}>Details</button>
+                {admin && (x.is_active || !x.has_history) && (
+                  <button onClick={() => remove(x)}>
+                    {x.is_active ? "Delete / archive" : "Delete"}
+                  </button>
+                )}
+              </div>,
           ],
         ]}
       />
@@ -1093,10 +2235,14 @@ function MovementTable({
   rows,
   reload,
   allowDelete = false,
+  showEmployee = true,
+  detailsInNotes = false,
 }: {
   rows: O[];
   reload: () => void;
   allowDelete?: boolean;
+  showEmployee?: boolean;
+  detailsInNotes?: boolean;
 }) {
   const remove = async (m: O) => {
     const reason = prompt("Why is this inventory operation being reversed?");
@@ -1125,14 +2271,31 @@ function MovementTable({
       (x: O) => (x.purchase_price === null ? "—" : gel(x.purchase_price)),
     ],
     ["Supplier", (x: O) => x.supplier_name || "—"],
-    ["Employee", (x: O) => x.employee_name],
-    ["Notes", (x: O) => <NoteButton note={x.notes} />],
+    [
+      "Notes",
+      (x: O) =>
+        detailsInNotes ? (
+          <HistoryDetailsButton row={x} />
+        ) : (
+          <NoteButton note={x.notes} />
+        ),
+    ],
   ];
+  if (showEmployee)
+    cols.splice(cols.length - 1, 0, [
+      "Employee",
+      (x: O) => x.employee_name,
+    ]);
   if (allowDelete)
     cols.push(
       [
         "Status",
-        (x: O) => <StatusValue value={x.deleted_at ? "REVERSED" : "ACTIVE"} />,
+        (x: O) =>
+          x.type === "REVERSED" ? (
+            "—"
+          ) : (
+            <StatusValue value={x.deleted_at ? "REVERSED" : "ACTIVE"} />
+          ),
       ],
       [
         "Manage",
@@ -1169,7 +2332,6 @@ function Inventory({
   onChanged?: () => void;
 } = {}) {
   const [p, sp] = useState<O[]>([]),
-    [s, ss] = useState<O[]>([]),
     [h, sh] = useState<O[]>([]),
     [e, se] = useState(""),
     [reason, setReason] = useState("RETURN"),
@@ -1177,7 +2339,6 @@ function Inventory({
     [direction, setDirection] = useState("INCREASE");
   const load = () => {
     api("/products").then(sp);
-    api("/suppliers").then(ss);
     if (showHistory) api("/stock-movements").then(sh);
   };
   useEffect(load, []);
@@ -1192,7 +2353,6 @@ function Inventory({
               productId: f.get("productId"),
               quantity: +f.get("quantity")!,
               purchasePrice: +f.get("price")!,
-              supplierId: f.get("supplierId"),
               importDate: f.get("importDate"),
               notes: f.get("notes"),
             }
@@ -1242,22 +2402,11 @@ function Inventory({
           <label>Product{pick}</label>
           <label>
             Quantity
-            <input name="quantity" type="number" min="1" required />
+            <NumericInput name="quantity" integer min="1" required />
           </label>
           <label>
             Purchase price
-            <input name="price" type="number" min="0" step="0.01" required />
-          </label>
-          <label>
-            Supplier
-            <select name="supplierId" required>
-              <option value="">Select supplier</option>
-              {s.map((x) => (
-                <option key={x.id} value={x.id}>
-                  {x.name}
-                </option>
-              ))}
-            </select>
+            <NumericInput name="price" min="0" required />
           </label>
           <label>
             Import date
@@ -1279,9 +2428,9 @@ function Inventory({
           <label>Product{pick}</label>
           <label>
             Quantity
-            <input
+            <NumericInput
               name="quantity"
-              type="number"
+              integer
               min="1"
               value={qty}
               onChange={(x) => setQty(x.target.value)}
@@ -1304,7 +2453,7 @@ function Inventory({
           {reason === "RETURN" && (
             <label>
               Sale ID
-              <input name="saleNumber" type="number" min="1" required />
+              <NumericInput name="saleNumber" integer min="1" required />
             </label>
           )}
           {reason === "CORRECTION" && (
@@ -1346,28 +2495,247 @@ function Inventory({
   );
 }
 function History() {
-  const [h, sh] = useState<O[]>([]);
-  const load = () => api("/stock-movements").then(sh);
+  const [h, sh] = useState<O[]>([]),
+    [products, setProducts] = useState<O[]>([]),
+    [suppliers, setSuppliers] = useState<O[]>([]),
+    [errorMessage, setErrorMessage] = useState(""),
+    [filters, setFilters] = useState({
+      from: "",
+      to: "",
+      productId: "",
+      supplierId: "",
+      type: "",
+      status: "",
+      userId: "",
+      search: "",
+    });
+  const load = () =>
+    Promise.all([
+      api("/stock-movements"),
+      api("/products?status=all"),
+      api("/suppliers"),
+    ])
+      .then(([rows, productRows, supplierRows]) => {
+        sh(rows);
+        setProducts(productRows);
+        setSuppliers(supplierRows);
+        setErrorMessage("");
+      })
+      .catch((error) => setErrorMessage(error.message));
   useEffect(load, []);
-  const display = h.map((x) =>
+  const types = [...new Set(h.map((row) => String(row.type || "")).filter(Boolean))].sort();
+  const statuses = [
+    ...new Set(h.map((row) => String(row.status || "")).filter(Boolean)),
+  ].sort();
+  const employees = [
+    ...new Map(
+      h
+        .filter((row) => row.user_id && row.employee_name)
+        .map((row) => [row.user_id, row.employee_name]),
+    ).entries(),
+  ].sort((a, b) => String(a[1]).localeCompare(String(b[1])));
+  const dateKey = (row: O) => {
+    const value = row.display_date || row.created_at;
+    if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value))
+      return value.slice(0, 10);
+    return today(value);
+  };
+  const filtered = h.filter((row) => {
+    const productIds = (row.product_ids || [row.product_id]).filter(Boolean);
+    const supplierIds = (row.supplier_ids || [row.supplier_id]).filter(Boolean);
+    const searchable = [
+      row.type,
+      row.status,
+      row.product_name,
+      row.supplier_name,
+      row.customer_name,
+      row.employee_name,
+      row.notes,
+      row.target_name,
+      row.sale_number,
+      row.field_name,
+      row.old_value,
+      row.new_value,
+      JSON.stringify(row.audit_details || {}),
+    ]
+      .filter((value) => value !== null && value !== undefined)
+      .join(" ")
+      .toLowerCase();
+    const rowDate = dateKey(row);
+    return (
+      (!filters.from || rowDate >= filters.from) &&
+      (!filters.to || rowDate <= filters.to) &&
+      (!filters.productId || productIds.includes(filters.productId)) &&
+      (!filters.supplierId || supplierIds.includes(filters.supplierId)) &&
+      (!filters.type || row.type === filters.type) &&
+      (!filters.status || row.status === filters.status) &&
+      (!filters.userId || row.user_id === filters.userId) &&
+      (!filters.search || searchable.includes(filters.search.toLowerCase()))
+    );
+  });
+  const display = filtered.map((x) =>
     x.type === "SALE" && x.sale_selling_price != null
       ? {
           ...x,
           product_name: `${x.product_name} | Selling Price: ${gel(x.sale_selling_price)}`,
         }
-      : x,
+      : { ...x, product_name: x.product_name || "—" },
   );
   return (
     <>
       <h2>History</h2>
-      <MovementTable rows={display} reload={load} />
+      <form className="history-filters" onSubmit={(event) => event.preventDefault()}>
+        <label>
+          From
+          <input
+            type="date"
+            value={filters.from}
+            onChange={(event) =>
+              setFilters({ ...filters, from: event.target.value })
+            }
+          />
+        </label>
+        <label>
+          To
+          <input
+            type="date"
+            value={filters.to}
+            onChange={(event) =>
+              setFilters({ ...filters, to: event.target.value })
+            }
+          />
+        </label>
+        <label>
+          Product
+          <select
+            value={filters.productId}
+            onChange={(event) =>
+              setFilters({ ...filters, productId: event.target.value })
+            }
+          >
+            <option value="">All</option>
+            {products.map((product) => (
+              <option key={product.id} value={product.id}>
+                {product.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Supplier
+          <select
+            value={filters.supplierId}
+            onChange={(event) =>
+              setFilters({ ...filters, supplierId: event.target.value })
+            }
+          >
+            <option value="">All</option>
+            {suppliers.map((supplier) => (
+              <option key={supplier.id} value={supplier.id}>
+                {supplier.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Movement type
+          <select
+            value={filters.type}
+            onChange={(event) =>
+              setFilters({ ...filters, type: event.target.value })
+            }
+          >
+            <option value="">All</option>
+            {types.map((type) => (
+              <option key={type} value={type}>
+                {type}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Status
+          <select
+            value={filters.status}
+            onChange={(event) =>
+              setFilters({ ...filters, status: event.target.value })
+            }
+          >
+            <option value="">All</option>
+            {statuses.map((status) => (
+              <option key={status} value={status}>
+                {status}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Employee
+          <select
+            value={filters.userId}
+            onChange={(event) =>
+              setFilters({ ...filters, userId: event.target.value })
+            }
+          >
+            <option value="">All</option>
+            {employees.map(([userId, name]) => (
+              <option key={userId} value={userId}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Search
+          <input
+            value={filters.search}
+            onChange={(event) =>
+              setFilters({ ...filters, search: event.target.value })
+            }
+            placeholder="Action, customer, note…"
+          />
+        </label>
+        <button
+          type="button"
+          onClick={() =>
+            setFilters({
+              from: "",
+              to: "",
+              productId: "",
+              supplierId: "",
+              type: "",
+              status: "",
+              userId: "",
+              search: "",
+            })
+          }
+        >
+          Clear filters
+        </button>
+      </form>
+      {errorMessage && <p className="error">{errorMessage}</p>}
+      <MovementTable rows={display} reload={load} detailsInNotes />
     </>
   );
 }
-function PaidEditor({ sale, reload }: { sale: O; reload: () => void }) {
+function PaidEditor({
+  sale,
+  reload,
+  hideValidationMessage = false,
+}: {
+  sale: O;
+  reload: () => void;
+  hideValidationMessage?: boolean;
+}) {
   const [value, setValue] = useState(String(sale.paid));
   useEffect(() => setValue(String(sale.paid)), [sale.paid]);
+  const numericValue = Number(value);
+  const validValue =
+    /^(?:\d+(?:\.\d+)?|\.\d+)$/.test(value) &&
+    numericValue >= +sale.paid &&
+    numericValue <= +(sale.effectiveTotal ?? sale.total);
   const save = async () => {
+    if (!validValue) return;
     try {
       await api("/sales/" + sale.id + "/paid", {
         method: "PUT",
@@ -1380,28 +2748,41 @@ function PaidEditor({ sale, reload }: { sale: O; reload: () => void }) {
   };
   return (
     <span>
-      <input
+      <NumericInput
         className="paid-input"
-        type="number"
+        hideValidationMessage={hideValidationMessage}
         min={sale.paid}
         max={sale.effectiveTotal ?? sale.total}
-        step="0.01"
         value={value}
         onChange={(e) => setValue(e.target.value)}
       />
-      <button onClick={save}>Save</button>
+      <button disabled={!validValue} onClick={save}>Save</button>
     </span>
   );
 }
 function Reservations() {
   const [p, sp] = useState<O[]>([]),
     [s, ss] = useState<O[]>([]),
+    [customers, setCustomers] = useState<O[]>([]),
     [r, sr] = useState<O[]>([]),
-    [e, se] = useState("");
+    [e, se] = useState(""),
+    [quantity, setQuantity] = useState("1"),
+    [sellingPrice, setSellingPrice] = useState("0"),
+    [deposit, setDeposit] = useState("0");
   const load = () => {
-    api("/products").then(sp);
-    api("/suppliers").then(ss);
-    api("/reservations").then(sr);
+    Promise.all([
+      api("/products"),
+      api("/suppliers"),
+      api("/customers"),
+      api("/reservations"),
+    ])
+      .then(([products, suppliers, customerRows, reservations]) => {
+        sp(products);
+        ss(suppliers);
+        setCustomers(customerRows);
+        sr(reservations);
+      })
+      .catch((error) => se(error.message));
   };
   const finish = async (x: O) => {
     try {
@@ -1439,13 +2820,19 @@ function Reservations() {
               method: "POST",
               body: JSON.stringify({
                 productId: f.get("productId"),
+                customerId: f.get("customerId") || null,
                 supplierId: f.get("supplierId") || null,
                 quantity: +f.get("quantity")!,
                 sellingPrice: +f.get("sellingPrice")!,
+                depositPaid: +f.get("depositPaid")!,
+                expiresAt: reservationExpiryIso(f.get("expiresAt")),
                 notes: f.get("notes"),
               }),
             });
             form.reset();
+            setQuantity("1");
+            setSellingPrice("0");
+            setDeposit("0");
             load();
           } catch (z: any) {
             se(z.message);
@@ -1464,6 +2851,17 @@ function Reservations() {
           </select>
         </label>
         <label>
+          Customer
+          <select name="customerId">
+            <option value="">No customer</option>
+            {customers.map((customer) => (
+              <option key={customer.id} value={customer.id}>
+                {customer.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
           Supplier
           <select name="supplierId">
             <option value="">No supplier</option>
@@ -1476,18 +2874,44 @@ function Reservations() {
         </label>
         <label>
           Quantity
-          <input name="quantity" type="number" min="1" defaultValue="1" />
-        </label>
-        <label>
-          Selling price
-          <input
-            name="sellingPrice"
-            type="number"
-            min="0"
-            step="0.01"
+          <NumericInput
+            name="quantity"
+            integer
+            min="1"
+            value={quantity}
+            onChange={(event) => setQuantity(event.target.value)}
             required
           />
         </label>
+        <label>
+          Selling price per unit
+          <NumericInput
+            name="sellingPrice"
+            min="0"
+            value={sellingPrice}
+            onChange={(event) => setSellingPrice(event.target.value)}
+            required
+          />
+        </label>
+        <label>
+          Deposit paid
+          <NumericInput
+            name="depositPaid"
+            min="0"
+            max={(+quantity || 0) * (+sellingPrice || 0)}
+            value={deposit}
+            onChange={(event) => setDeposit(event.target.value)}
+            required
+          />
+        </label>
+        <label>
+          Expiration date
+          <input name="expiresAt" type="date" />
+        </label>
+        <p className="form-calculation">
+          Reservation total: <b>{gel((+quantity || 0) * (+sellingPrice || 0))}</b><br />
+          Remaining after deposit: <b>{gel(Math.max(0, (+quantity || 0) * (+sellingPrice || 0) - (+deposit || 0)))}</b>
+        </p>
         <label>
           Notes
           <input name="notes" />
@@ -1499,9 +2923,14 @@ function Reservations() {
         rows={r}
         cols={[
           ["Product", (x) => x.product_name],
+          ["Customer", (x) => x.customer_name || "—"],
           ["Supplier", (x) => x.supplier_name || "—"],
           ["Quantity", (x) => x.quantity],
-          ["Selling price", (x) => gel(x.selling_price)],
+          ["Unit price", (x) => gel(x.selling_price)],
+          ["Reservation total", (x) => gel(x.reservation_total)],
+          ["Deposit paid", (x) => gel(x.deposit_paid)],
+          ["Remaining", (x) => gel(x.remaining)],
+          ["Expires", (x) => dt(x.expires_at)],
           [
             "Status",
             (x) => (
@@ -1636,8 +3065,59 @@ function Employees() {
     </>
   );
 }
+function NavigationDropdown({
+  label,
+  children,
+}: React.PropsWithChildren<{ label: string }>) {
+  const [clickedOpen, setClickedOpen] = useState(false);
+  const [suppressHover, setSuppressHover] = useState(false);
+  const dropdown = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const closeOutside = (event: PointerEvent) => {
+      if (!dropdown.current?.contains(event.target as Node))
+        setClickedOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOutside);
+    return () => document.removeEventListener("pointerdown", closeOutside);
+  }, []);
+  const items = React.Children.map(children, (child) => {
+    if (!React.isValidElement<{ onClick?: React.MouseEventHandler }>(child))
+      return child;
+    const originalClick = child.props.onClick;
+    return React.cloneElement(child, {
+      onClick: (event: React.MouseEvent) => {
+        originalClick?.(event);
+        setClickedOpen(false);
+        setSuppressHover(true);
+      },
+    });
+  });
+  return (
+    <div
+      ref={dropdown}
+      className={`nav-dropdown ${clickedOpen ? "is-click-open" : ""} ${suppressHover ? "suppress-hover" : ""}`}
+      onMouseLeave={() => setSuppressHover(false)}
+    >
+      <button
+        type="button"
+        className="nav-dropdown-trigger"
+        aria-haspopup="menu"
+        aria-expanded={clickedOpen}
+        onClick={() => {
+          setClickedOpen(true);
+          setSuppressHover(false);
+        }}
+      >
+        {label}
+      </button>
+      <div className="nav-dropdown-menu" role="menu">
+        {items}
+      </div>
+    </div>
+  );
+}
 function Shell({ u, out }: { u: O; out: () => void }) {
-  const n = [
+  const primaryNavigation = [
     "Dashboard",
     "Products",
     "Inventory",
@@ -1645,13 +3125,6 @@ function Shell({ u, out }: { u: O; out: () => void }) {
     "Reservations",
     "Payments",
     "Deliveries",
-    "Customers",
-    "Suppliers",
-    "Contacts",
-    "History",
-    "Reports",
-    "Employees",
-    "Settings",
   ];
   return (
     <div className="shell">
@@ -1659,22 +3132,29 @@ function Shell({ u, out }: { u: O; out: () => void }) {
         <h1>
           <ShopTitle />
         </h1>
-        {n
-          .filter(
-            (x) =>
-              u.role === "ADMIN" ||
-              !["Reports", "Employees"].includes(x),
-          )
-          .map((x) => (
-            <NavLink
-              key={x}
-              to={x === "Dashboard" ? "/" : "/" + x.toLowerCase()}
-              end={x === "Dashboard"}
-            >
-              {x}
-            </NavLink>
-          ))}
-        <button onClick={out}>Sign out</button>
+        {primaryNavigation.map((x) => (
+          <NavLink
+            key={x}
+            to={x === "Dashboard" ? "/" : "/" + x.toLowerCase()}
+            end={x === "Dashboard"}
+          >
+            {x}
+          </NavLink>
+        ))}
+        <NavigationDropdown label="Contacts">
+          <NavLink to="/customers">Customers</NavLink>
+          <NavLink to="/suppliers">Suppliers</NavLink>
+          <NavLink to="/contacts">Contacts</NavLink>
+        </NavigationDropdown>
+        <NavLink to="/history">History</NavLink>
+        {u.role === "ADMIN" && <NavLink to="/reports">Reports</NavLink>}
+        <NavigationDropdown label="Other">
+          {u.role === "ADMIN" && (
+            <NavLink to="/employees">Employees</NavLink>
+          )}
+          <NavLink to="/settings">Settings</NavLink>
+          <button onClick={out}>Sign out</button>
+        </NavigationDropdown>
       </aside>
       <main>
         <Routes>
@@ -1684,6 +3164,10 @@ function Shell({ u, out }: { u: O; out: () => void }) {
             element={<Products admin={u.role === "ADMIN"} />}
           />
           <Route path="/inventory" element={<InventoryWithSummary />} />
+          <Route
+            path="/inventory/:id"
+            element={<InventoryDetail admin={u.role === "ADMIN"} />}
+          />
           <Route path="/sales" element={<SalesWithBusinessDate />} />
           <Route path="/reservations" element={<Reservations />} />
           <Route path="/payments" element={<Payments />} />
@@ -1723,7 +3207,10 @@ function Shell({ u, out }: { u: O; out: () => void }) {
           <Route path="/history" element={<History />} />
           <Route path="/reports" element={<ReportsWithPeriods />} />
           <Route path="/employees" element={<Employees />} />
-          <Route path="/settings" element={<SettingsWithPreferences />} />
+          <Route
+            path="/settings"
+            element={<SettingsWithPreferences admin={u.role === "ADMIN"} />}
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>

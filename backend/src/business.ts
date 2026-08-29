@@ -81,6 +81,18 @@ export function calculateSaleBalance(
   return { effectiveTotal, paid, remaining, paymentStatus };
 }
 
+export function calculateReservationBalance(
+  quantity: number,
+  unitPrice: number,
+  deposit: number,
+) {
+  const total = roundMoney(quantity * unitPrice);
+  return {
+    total,
+    remaining: Math.max(0, roundMoney(total - deposit)),
+  };
+}
+
 export function nextDeliveryStatus(current: string): DeliveryStatus {
   return current === "IN_TRANSIT" || current === "DELIVERED"
     ? "DELIVERED"
