@@ -1,1 +1,173 @@
-*{box-sizing:border-box}body{margin:0;font:14px Arial,sans-serif;background:#f4f5f7;color:#20242a}button,input,select{font:inherit;padding:8px;border:1px solid #cbd1d8;border-radius:4px;background:white}button{background:#245d91;color:white;cursor:pointer;border:0}.shell{display:grid;grid-template-columns:210px 1fr;min-height:100vh}aside{padding:18px;background:#202b36;color:white}aside h1{font-size:19px;margin:0 0 20px}aside a,aside button{display:block;width:100%;padding:9px;margin:2px 0;color:white;background:transparent;text-decoration:none;text-align:left}aside a.active{background:#3a526a}main{padding:24px;max-width:1400px;width:100%}h2{margin-top:0}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px}.card{background:white;padding:16px;border-radius:5px;box-shadow:0 1px 2px #ccd}.card small{display:block;color:#69717a}.card strong{font-size:22px;display:block;margin-top:8px}.table{overflow:auto;background:white;margin-top:12px}table{width:100%;border-collapse:collapse}th,td{padding:9px;border-bottom:1px solid #e2e5e8;text-align:left;white-space:nowrap}th{background:#eef1f4}.sort{background:transparent;color:inherit;padding:0;border:0;font-weight:bold;text-align:left}form{display:flex;gap:9px;flex-wrap:wrap;background:white;padding:14px;margin:12px 0;border-radius:5px}form label{display:flex;flex-direction:column;gap:4px}.toolbar{display:flex;gap:8px}.twocol{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}.twocol form,.sale{display:flex;flex-direction:column;align-items:stretch}.error{color:#b42318;font-weight:bold}.login{max-width:360px;margin:10vh auto}.login form{flex-direction:column}@media(max-width:700px){.shell{grid-template-columns:1fr}aside{display:flex;gap:4px;overflow:auto;padding:10px}aside h1{display:none}aside a,aside button{width:auto;white-space:nowrap}main{padding:14px}}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font-family: "Open Sans", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  background: #f4f5f7;
+  color: #20242a;
+}
+button,
+input,
+select {
+  font: inherit;
+  padding: 9px 12px;
+  border: 1px solid #cbd1d8;
+  border-radius: 10px;
+  background: white;
+}
+button {
+  background: #245d91;
+  color: white;
+  cursor: pointer;
+  border: 0;
+  border-radius: 999px;
+}
+.shell {
+  display: grid;
+  grid-template-columns: 210px 1fr;
+  min-height: 100vh;
+}
+aside {
+  padding: 18px;
+  background: #202b36;
+  color: white;
+}
+aside h1 {
+  font-size: 20px;
+  margin: 0 0 20px;
+}
+aside a,
+aside button {
+  display: block;
+  width: 100%;
+  padding: 10px 12px;
+  margin: 4px 0;
+  color: white;
+  background: transparent;
+  text-decoration: none;
+  text-align: left;
+}
+aside a.active {
+  background: #3a526a;
+}
+main {
+  padding: 24px;
+  max-width: 1400px;
+  width: 100%;
+}
+h2 {
+  margin-top: 0;
+}
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 12px;
+}
+.card {
+  background: white;
+  padding: 18px;
+  border-radius: 14px;
+  box-shadow: 0 1px 2px #ccd;
+}
+.card small {
+  display: block;
+  color: #69717a;
+}
+.card strong {
+  font-size: 22px;
+  display: block;
+  margin-top: 8px;
+}
+.table {
+  overflow: auto;
+  background: white;
+  margin-top: 12px;
+  border-radius: 14px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th,
+td {
+  padding: 9px;
+  border-bottom: 1px solid #e2e5e8;
+  text-align: left;
+  white-space: nowrap;
+}
+th {
+  background: #eef1f4;
+}
+.sort {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  border: 0;
+  font-weight: bold;
+  text-align: left;
+}
+form {
+  display: flex;
+  gap: 9px;
+  flex-wrap: wrap;
+  background: white;
+  padding: 18px;
+  margin: 12px 0;
+  border-radius: 14px;
+}
+form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.toolbar {
+  display: flex;
+  gap: 8px;
+}
+.twocol {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 12px;
+}
+.twocol form,
+.sale {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.error {
+  color: #b42318;
+  font-weight: bold;
+}
+.login {
+  max-width: 360px;
+  margin: 10vh auto;
+}
+.login form {
+  flex-direction: column;
+}
+@media (max-width: 700px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  aside {
+    display: flex;
+    gap: 4px;
+    overflow: auto;
+    padding: 10px;
+  }
+  aside h1 {
+    display: none;
+  }
+  aside a,
+  aside button {
+    width: auto;
+    white-space: nowrap;
+  }
+  main {
+    padding: 14px;
+  }
+}

@@ -1,91 +1,2224 @@
-import 'dotenv/config';
-import express, { NextFunction, Request, Response } from 'express';
-import cors from 'cors';
-import rateLimit from 'express-rate-limit';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import multer from 'multer';
-import path from 'path';
-import fs from 'fs';
-import { randomUUID } from 'crypto';
-import { z } from 'zod';
-import { pool, tx } from './db';
-import { PoolClient } from 'pg';
+import "dotenv/config";
+import express, { NextFunction, Request, Response } from "express";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
+import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import { randomUUID } from "crypto";
+import { z } from "zod";
+import { pool, tx } from "./db";
+import { runMigrations } from "./migrate";
+import { PoolClient } from "pg";
+import {
+  businessDate,
+  calculateSaleBalance,
+  isValidDateOnly,
+  nextDeliveryStatus,
+  reportPeriodBounds,
+  returnNote as formatReturnNote,
+  returnStatus,
+} from "./business";
 
-type User={id:string;name:string;username:string;role:'ADMIN'|'EMPLOYEE'};
-declare global { namespace Express { interface Request { user?:User } } }
-const app=express(), secret=process.env.JWT_SECRET || 'development-only-change-me';
-const uploadDir=process.env.UPLOAD_DIR || path.resolve('uploads'); fs.mkdirSync(path.join(uploadDir,'products'),{recursive:true});
-app.use(cors({origin:(process.env.CORS_ORIGIN||'').split(',').filter(Boolean).length ? (process.env.CORS_ORIGIN||'').split(',') : true})); app.use(express.json({limit:'1mb'})); app.use('/uploads',express.static(uploadDir));
-const asyncRoute=(fn:(r:Request,s:Response,n:NextFunction)=>Promise<unknown>)=>(r:Request,s:Response,n:NextFunction)=>Promise.resolve(fn(r,s,n)).catch(n);
-const error=(code:string,message:string,status=400)=>Object.assign(new Error(message),{code,status});
-const auth=(roles?:User['role'][])=>(req:Request,_:Response,next:NextFunction)=>{try { const token=req.headers.authorization?.replace(/^Bearer\s+/,''); if(!token) throw error('UNAUTHORIZED','Login required',401); const u=jwt.verify(token,secret) as User; if(roles&&!roles.includes(u.role)) throw error('FORBIDDEN','You do not have access to this action',403); req.user=u; next(); } catch(e) { next((e as any).code?e:error('UNAUTHORIZED','Invalid or expired login',401)); }};
-const audit=async(c:PoolClient,user:User,action:string,type:string,id?:string,details={})=>c.query('INSERT INTO audit_logs(user_id,action,entity_type,entity_id,details) VALUES($1,$2,$3,$4,$5)',[user.id,action,type,id||null,details]);
-const productEvent=async(c:PoolClient,user:User,productId:string|undefined,action:string,notes?:string)=>{const p=productId?await c.query('SELECT name FROM products WHERE id=$1',[productId]):{rows:[{name:null}]};return c.query('INSERT INTO product_events(product_id,product_name,action,user_id,notes) VALUES($1,$2,$3,$4,$5)',[productId||null,p.rows[0]?.name||null,action,user.id,notes||null]);};
-const id=z.string().uuid(); const money=z.coerce.number().nonnegative(); const qty=z.coerce.number().int().positive();
-const productSchema=z.object({name:z.string().min(1),categoryId:id.optional().nullable(),supplierId:id.optional().nullable(),description:z.string().optional().nullable(),purchasePrice:money.default(0),sellingPrice:money.default(0),width:z.coerce.number().nonnegative().optional().nullable(),height:z.coerce.number().nonnegative().optional().nullable(),depth:z.coerce.number().nonnegative().optional().nullable(),material:z.string().optional().nullable(),color:z.string().optional().nullable(),isActive:z.boolean().optional()});
-const contactSchema=z.object({name:z.string().min(1),phone:z.string().optional().nullable(),email:z.string().email().optional().or(z.literal('')).nullable(),address:z.string().optional().nullable(),notes:z.string().optional().nullable()});
+type User = {
+  id: string;
+  name: string;
+  username: string;
+  role: "ADMIN" | "EMPLOYEE";
+};
+declare global {
+  namespace Express {
+    interface Request {
+      user?: User;
+    }
+  }
+}
+const app = express(),
+  secret = process.env.JWT_SECRET || "development-only-change-me";
+app.set("trust proxy", 1);
+const uploadDir = process.env.UPLOAD_DIR || path.resolve("uploads");
+fs.mkdirSync(path.join(uploadDir, "products"), { recursive: true });
+app.use(
+  cors({
+    origin: (process.env.CORS_ORIGIN || "").split(",").filter(Boolean).length
+      ? (process.env.CORS_ORIGIN || "").split(",")
+      : true,
+  }),
+);
+app.use(express.json({ limit: "1mb" }));
+app.use("/uploads", express.static(uploadDir));
+const asyncRoute =
+  (fn: (r: Request, s: Response, n: NextFunction) => Promise<unknown>) =>
+  (r: Request, s: Response, n: NextFunction) =>
+    Promise.resolve(fn(r, s, n)).catch(n);
+const error = (code: string, message: string, status = 400) =>
+  Object.assign(new Error(message), { code, status });
+const auth =
+  (roles?: User["role"][]) =>
+  asyncRoute(async (req: Request, _: Response, next: NextFunction) => {
+    let tokenUser: User;
+    try {
+      const token = req.headers.authorization?.replace(/^Bearer\s+/, "");
+      if (!token) throw error("UNAUTHORIZED", "Login required", 401);
+      tokenUser = jwt.verify(token, secret) as User;
+    } catch (e) {
+      throw (e as any).code
+        ? e
+        : error("UNAUTHORIZED", "Invalid or expired login", 401);
+    }
 
-app.get('/health',asyncRoute(async(_q,res)=>{await pool.query('SELECT 1');res.json({status:'ok'});}));
-app.post('/api/auth/login',rateLimit({windowMs:60000,max:10,standardHeaders:true,legacyHeaders:false}),asyncRoute(async(req,res)=>{const {username,password}=z.object({username:z.string().min(1),password:z.string().min(1)}).parse(req.body);const r=await pool.query('SELECT * FROM users WHERE username=$1',[username]);const u=r.rows[0];if(!u||!u.is_active||!await bcrypt.compare(password,u.password_hash))throw error('INVALID_LOGIN','Invalid username or password',401);const user={id:u.id,name:u.name,username:u.username,role:u.role} as User;await pool.query('UPDATE users SET last_login=now() WHERE id=$1',[u.id]);await pool.query("INSERT INTO audit_logs(user_id,action,entity_type,entity_id) VALUES($1,'LOGIN','USER',$1)",[u.id]);res.json({token:jwt.sign(user,secret,{expiresIn:'12h'}),user});}));
-app.get('/api/auth/me',auth(),(req,res)=>res.json(req.user));
-app.put('/api/auth/password',auth(),asyncRoute(async(req,res)=>{const x=z.object({oldPassword:z.string().min(1),newPassword:z.string().min(8),confirmPassword:z.string().min(8)}).parse(req.body);if(x.newPassword!==x.confirmPassword)throw error('PASSWORD_MISMATCH','New password and confirmation must match');if(x.oldPassword===x.newPassword)throw error('PASSWORD_REUSE','New password must be different from the old password');await tx(async c=>{const user=await c.query('SELECT password_hash FROM users WHERE id=$1 FOR UPDATE',[req.user!.id]);if(!user.rowCount||!await bcrypt.compare(x.oldPassword,user.rows[0].password_hash))throw error('INVALID_PASSWORD','Current password is incorrect');await c.query('UPDATE users SET password_hash=$1 WHERE id=$2',[await bcrypt.hash(x.newPassword,12),req.user!.id]);await audit(c,req.user!,'CHANGE_PASSWORD','USER',req.user!.id);});res.json({ok:true});}));
+    const current = await pool.query(
+      "SELECT id,name,username,role,is_active FROM users WHERE id=$1",
+      [tokenUser.id],
+    );
+    if (!current.rowCount || !current.rows[0].is_active)
+      throw error("UNAUTHORIZED", "This account is no longer active", 401);
 
-function listResource(table:string,columns='*') { return asyncRoute(async(req,res)=>{const q=String(req.query.q||'');const r=await pool.query(`SELECT ${columns} FROM ${table} ${q?"WHERE name ILIKE $1 OR COALESCE(phone,'') ILIKE $1":''} ORDER BY created_at DESC`,q?[`%${q}%`]:[]);res.json(r.rows);}); }
-function contactRoutes(name:string,table:string,adminWrite=false){app.get(`/api/${name}`,auth(),listResource(table));app.post(`/api/${name}`,auth(adminWrite?['ADMIN']:undefined),asyncRoute(async(req,res)=>{const x=contactSchema.parse(req.body);const r=await pool.query(`INSERT INTO ${table}(name,phone,email,address,notes) VALUES($1,$2,$3,$4,$5) RETURNING *`,[x.name,x.phone||null,x.email||null,x.address||null,x.notes||null]);res.status(201).json(r.rows[0]);}));app.patch(`/api/${name}/:id`,auth(adminWrite?['ADMIN']:undefined),asyncRoute(async(req,res)=>{const x=contactSchema.partial().parse(req.body);const keys=Object.keys(x);if(!keys.length)throw error('VALIDATION','No changes supplied');const r=await pool.query(`UPDATE ${table} SET ${keys.map((k,i)=>`${k.replace(/[A-Z]/g,m=>'_'+m.toLowerCase())}=$${i+1}`).join(',')},updated_at=now() WHERE id=$${keys.length+1} RETURNING *`,[...Object.values(x),id.parse(req.params.id)]);if(!r.rowCount)throw error('NOT_FOUND','Record not found',404);res.json(r.rows[0]);}));}
-contactRoutes('customers','customers'); contactRoutes('suppliers','suppliers',true);
-app.get('/api/contacts',auth(),listResource('contacts')); app.post('/api/contacts',auth(['ADMIN']),asyncRoute(async(req,res)=>{const x=contactSchema.extend({type:z.string().min(1).default('OTHER')}).parse(req.body);const r=await pool.query('INSERT INTO contacts(name,type,phone,email,notes) VALUES($1,$2,$3,$4,$5) RETURNING *',[x.name,x.type,x.phone||null,x.email||null,x.notes||null]);res.status(201).json(r.rows[0]);}));
+    const user = {
+      id: current.rows[0].id,
+      name: current.rows[0].name,
+      username: current.rows[0].username,
+      role: current.rows[0].role,
+    } as User;
+    if (roles && !roles.includes(user.role))
+      throw error("FORBIDDEN", "You do not have access to this action", 403);
+    req.user = user;
+    next();
+  });
+const audit = async (
+  c: PoolClient,
+  user: User,
+  action: string,
+  type: string,
+  id?: string,
+  details = {},
+) =>
+  c.query(
+    "INSERT INTO audit_logs(user_id,action,entity_type,entity_id,details) VALUES($1,$2,$3,$4,$5)",
+    [user.id, action, type, id || null, details],
+  );
+const productEvent = async (
+  c: PoolClient,
+  user: User,
+  productId: string | undefined,
+  action: string,
+  notes?: string,
+) => {
+  const p = productId
+    ? await c.query("SELECT name FROM products WHERE id=$1", [productId])
+    : { rows: [{ name: null }] };
+  return c.query(
+    "INSERT INTO product_events(product_id,product_name,action,user_id,notes) VALUES($1,$2,$3,$4,$5)",
+    [
+      productId || null,
+      p.rows[0]?.name || null,
+      action,
+      user.id,
+      notes || null,
+    ],
+  );
+};
+const id = z.string().uuid();
+const money = z.coerce.number().finite().nonnegative();
+const qty = z.coerce.number().int().positive();
+const dateOnly = z
+  .string()
+  .refine(isValidDateOnly, "Choose a valid calendar date");
+const productSchema = z.object({
+  name: z.string().min(1),
+  categoryId: id.optional().nullable(),
+  supplierId: id.optional().nullable(),
+  description: z.string().optional().nullable(),
+  purchasePrice: money.default(0),
+  sellingPrice: money.default(0),
+  width: z.coerce.number().nonnegative().optional().nullable(),
+  height: z.coerce.number().nonnegative().optional().nullable(),
+  depth: z.coerce.number().nonnegative().optional().nullable(),
+  material: z.string().optional().nullable(),
+  color: z.string().optional().nullable(),
+  isActive: z.boolean().optional(),
+});
+const contactSchema = z.object({
+  name: z.string().min(1),
+  phone: z.string().optional().nullable(),
+  email: z.string().email().optional().or(z.literal("")).nullable(),
+  address: z.string().optional().nullable(),
+  notes: z.string().optional().nullable(),
+});
 
-app.get('/api/categories',auth(),listResource('categories'));
-app.post('/api/categories',auth(['ADMIN']),asyncRoute(async(req,res)=>{const x=z.object({name:z.string().min(1)}).parse(req.body);const r=await pool.query('INSERT INTO categories(name) VALUES($1) RETURNING *',[x.name]);res.status(201).json(r.rows[0]);}));
-app.patch('/api/categories/:id',auth(['ADMIN']),asyncRoute(async(req,res)=>{const x=z.object({name:z.string().min(1).optional(),isActive:z.boolean().optional()}).parse(req.body);const r=await pool.query('UPDATE categories SET name=COALESCE($1,name),is_active=COALESCE($2,is_active) WHERE id=$3 RETURNING *',[x.name,x.isActive,id.parse(req.params.id)]);if(!r.rowCount)throw error('NOT_FOUND','Category not found',404);res.json(r.rows[0]);}));
+app.get(
+  "/health",
+  asyncRoute(async (_q, res) => {
+    await pool.query("SELECT 1");
+    res.json({ status: "ok" });
+  }),
+);
+app.post(
+  "/api/auth/login",
+  rateLimit({
+    windowMs: 60000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+  }),
+  asyncRoute(async (req, res) => {
+    const { username, password } = z
+      .object({ username: z.string().min(1), password: z.string().min(1) })
+      .parse(req.body);
+    const r = await pool.query("SELECT * FROM users WHERE username=$1", [
+      username,
+    ]);
+    const u = r.rows[0];
+    if (
+      !u ||
+      !u.is_active ||
+      !(await bcrypt.compare(password, u.password_hash))
+    )
+      throw error("INVALID_LOGIN", "Invalid username or password", 401);
+    const user = {
+      id: u.id,
+      name: u.name,
+      username: u.username,
+      role: u.role,
+    } as User;
+    await pool.query("UPDATE users SET last_login=now() WHERE id=$1", [u.id]);
+    await pool.query(
+      "INSERT INTO audit_logs(user_id,action,entity_type,entity_id) VALUES($1,'LOGIN','USER',$1)",
+      [u.id],
+    );
+    res.json({ token: jwt.sign(user, secret, { expiresIn: "12h" }), user });
+  }),
+);
+app.get("/api/auth/me", auth(), (req, res) => res.json(req.user));
+app.put(
+  "/api/auth/password",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const x = z
+      .object({
+        oldPassword: z.string().min(1),
+        newPassword: z.string().min(8),
+        confirmPassword: z.string().min(8),
+      })
+      .parse(req.body);
+    if (x.newPassword !== x.confirmPassword)
+      throw error(
+        "PASSWORD_MISMATCH",
+        "New password and confirmation must match",
+      );
+    if (x.oldPassword === x.newPassword)
+      throw error(
+        "PASSWORD_REUSE",
+        "New password must be different from the old password",
+      );
+    await tx(async (c) => {
+      const user = await c.query(
+        "SELECT password_hash FROM users WHERE id=$1 FOR UPDATE",
+        [req.user!.id],
+      );
+      if (
+        !user.rowCount ||
+        !(await bcrypt.compare(x.oldPassword, user.rows[0].password_hash))
+      )
+        throw error("INVALID_PASSWORD", "Current password is incorrect");
+      await c.query("UPDATE users SET password_hash=$1 WHERE id=$2", [
+        await bcrypt.hash(x.newPassword, 12),
+        req.user!.id,
+      ]);
+      await audit(c, req.user!, "CHANGE_PASSWORD", "USER", req.user!.id);
+    });
+    res.json({ ok: true });
+  }),
+);
 
-app.get('/api/products',auth(),asyncRoute(async(req,res)=>{const q=String(req.query.q||''),status=String(req.query.status||'active'),out=req.query.out==='true';const where:string[]=[];const p:any[]=[];if(q){p.push(`%${q}%`);where.push(`p.name ILIKE $${p.length}`);}if(status!=='all'){p.push(status==='active');where.push(`p.is_active=$${p.length}`)}if(out)where.push('p.current_quantity=0');const r=await pool.query(`SELECT p.*,c.name category_name,s.name supplier_name,(p.current_quantity-p.reserved_quantity) available_quantity,(SELECT storage_path FROM product_images i WHERE i.product_id=p.id ORDER BY i.is_primary DESC,i.created_at LIMIT 1) primary_image FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN suppliers s ON s.id=p.supplier_id ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY p.name`,p);res.json(r.rows);}));
-app.get('/api/products/:id',auth(),asyncRoute(async(req,res)=>{const r=await pool.query('SELECT p.*,(p.current_quantity-p.reserved_quantity) available_quantity FROM products p WHERE p.id=$1',[id.parse(req.params.id)]);if(!r.rowCount)throw error('NOT_FOUND','Product not found',404);const images=await pool.query('SELECT * FROM product_images WHERE product_id=$1 ORDER BY is_primary DESC,created_at',[r.rows[0].id]);res.json({...r.rows[0],images:images.rows});}));
-app.post('/api/products',auth(['ADMIN']),asyncRoute(async(req,res)=>{const x=productSchema.parse(req.body);const product=await tx(async c=>{const r=await c.query('INSERT INTO products(name,category_id,supplier_id,description,purchase_price,selling_price,width,height,depth,material,color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *',[x.name,x.categoryId,x.supplierId,x.description,x.purchasePrice,x.sellingPrice,x.width,x.height,x.depth,x.material,x.color]);await productEvent(c,req.user!,r.rows[0].id,'PRODUCT_CREATED');await audit(c,req.user!,'CREATE','PRODUCT',r.rows[0].id);return r.rows[0]});res.status(201).json(product);}));
-app.patch('/api/products/:id',auth(['ADMIN']),asyncRoute(async(req,res)=>{const x=productSchema.partial().parse(req.body), map:any={categoryId:'category_id',supplierId:'supplier_id',purchasePrice:'purchase_price',sellingPrice:'selling_price',isActive:'is_active'};const keys=Object.keys(x);if(!keys.length)throw error('VALIDATION','No changes supplied');const vals=keys.map(k=>(x as any)[k]);const product=await tx(async c=>{const r=await c.query(`UPDATE products SET ${keys.map((k,i)=>`${map[k]||k}=$${i+1}`).join(',')},updated_at=now() WHERE id=$${keys.length+1} RETURNING *`,[...vals,id.parse(req.params.id)]);if(!r.rowCount)throw error('NOT_FOUND','Product not found',404);await audit(c,req.user!,'UPDATE','PRODUCT',r.rows[0].id,x);return r.rows[0]});res.json(product);}));
-app.delete('/api/products/:id',auth(['ADMIN']),asyncRoute(async(req,res)=>{const productId=id.parse(req.params.id);const result=await tx(async c=>{const product=await c.query('SELECT id FROM products WHERE id=$1 FOR UPDATE',[productId]);if(!product.rowCount)throw error('NOT_FOUND','Product not found',404);const history=await c.query("SELECT EXISTS(SELECT 1 FROM sale_items WHERE product_id=$1) OR EXISTS(SELECT 1 FROM stock_movements WHERE product_id=$1) OR EXISTS(SELECT 1 FROM reservations WHERE product_id=$1) AS has_history",[productId]);if(history.rows[0].has_history){await c.query('UPDATE products SET is_active=false,updated_at=now() WHERE id=$1',[productId]);await productEvent(c,req.user!,productId,'PRODUCT_ARCHIVED');await audit(c,req.user!,'ARCHIVE','PRODUCT',productId);return {archived:true}}await productEvent(c,req.user!,productId,'PRODUCT_DELETED');await c.query('DELETE FROM products WHERE id=$1',[productId]);await audit(c,req.user!,'DELETE','PRODUCT',productId);return {deleted:true}});res.json(result);}));
-const uploader=multer({storage:multer.diskStorage({destination:(_r,_f,cb)=>cb(null,path.join(uploadDir,'products')),filename:(_r,f,cb)=>cb(null,`${randomUUID()}${path.extname(f.originalname).toLowerCase()}`)}),limits:{fileSize:5*1024*1024,files:5},fileFilter:(_r,f,cb)=>cb(null,['image/jpeg','image/png','image/webp'].includes(f.mimetype))});
-app.post('/api/products/:id/images',auth(['ADMIN']),uploader.single('image'),asyncRoute(async(req,res)=>{const productId=id.parse(req.params.id);if(!req.file)throw error('INVALID_IMAGE','Use JPG, PNG, or WebP up to 5 MB');const n=await pool.query('SELECT count(*) FROM product_images WHERE product_id=$1',[productId]);if(+n.rows[0].count>=5){fs.unlinkSync(req.file.path);throw error('IMAGE_LIMIT','Maximum 5 images per product');}const r=await pool.query('INSERT INTO product_images(product_id,filename,storage_path,is_primary) VALUES($1,$2,$3,NOT EXISTS(SELECT 1 FROM product_images WHERE product_id=$1)) RETURNING *',[productId,req.file.filename,`products/${req.file.filename}`]);res.status(201).json(r.rows[0]);}));
-app.delete('/api/product-images/:id',auth(['ADMIN']),asyncRoute(async(req,res)=>{const r=await pool.query('DELETE FROM product_images WHERE id=$1 RETURNING storage_path',[id.parse(req.params.id)]);if(!r.rowCount)throw error('NOT_FOUND','Image not found',404);fs.unlink(path.join(uploadDir,r.rows[0].storage_path),()=>{});res.status(204).end();})); app.post('/api/product-images/:id/primary',auth(['ADMIN']),asyncRoute(async(req,res)=>{const r=await pool.query('SELECT product_id FROM product_images WHERE id=$1',[id.parse(req.params.id)]);if(!r.rowCount)throw error('NOT_FOUND','Image not found',404);await pool.query('UPDATE product_images SET is_primary=(id=$1) WHERE product_id=$2',[req.params.id,r.rows[0].product_id]);res.json({ok:true});}));
+function listResource(table: string, columns = "*", searchPhone = true) {
+  return asyncRoute(async (req, res) => {
+    const q = String(req.query.q || "");
+    const search = searchPhone
+      ? "WHERE name ILIKE $1 OR COALESCE(phone,'') ILIKE $1"
+      : "WHERE name ILIKE $1";
+    const r = await pool.query(
+      `SELECT ${columns} FROM ${table} ${q ? search : ""} ORDER BY created_at DESC`,
+      q ? [`%${q}%`] : [],
+    );
+    res.json(r.rows);
+  });
+}
+function contactRoutes(name: string, table: string, adminWrite = false) {
+  app.get(`/api/${name}`, auth(), listResource(table));
+  app.post(
+    `/api/${name}`,
+    auth(adminWrite ? ["ADMIN"] : undefined),
+    asyncRoute(async (req, res) => {
+      const x = contactSchema.parse(req.body);
+      const r = await pool.query(
+        `INSERT INTO ${table}(name,phone,email,address,notes) VALUES($1,$2,$3,$4,$5) RETURNING *`,
+        [
+          x.name,
+          x.phone || null,
+          x.email || null,
+          x.address || null,
+          x.notes || null,
+        ],
+      );
+      res.status(201).json(r.rows[0]);
+    }),
+  );
+  app.patch(
+    `/api/${name}/:id`,
+    auth(adminWrite ? ["ADMIN"] : undefined),
+    asyncRoute(async (req, res) => {
+      const x = contactSchema.partial().parse(req.body);
+      const keys = Object.keys(x);
+      if (!keys.length) throw error("VALIDATION", "No changes supplied");
+      const r = await pool.query(
+        `UPDATE ${table} SET ${keys.map((k, i) => `${k.replace(/[A-Z]/g, (m) => "_" + m.toLowerCase())}=$${i + 1}`).join(",")},updated_at=now() WHERE id=$${keys.length + 1} RETURNING *`,
+        [...Object.values(x), id.parse(req.params.id)],
+      );
+      if (!r.rowCount) throw error("NOT_FOUND", "Record not found", 404);
+      res.json(r.rows[0]);
+    }),
+  );
+}
+contactRoutes("customers", "customers");
+contactRoutes("suppliers", "suppliers", true);
+app.get("/api/contacts", auth(), listResource("contacts"));
+app.post(
+  "/api/contacts",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const x = contactSchema
+      .extend({ type: z.string().min(1).default("OTHER") })
+      .parse(req.body);
+    const r = await pool.query(
+      "INSERT INTO contacts(name,type,phone,email,notes) VALUES($1,$2,$3,$4,$5) RETURNING *",
+      [x.name, x.type, x.phone || null, x.email || null, x.notes || null],
+    );
+    res.status(201).json(r.rows[0]);
+  }),
+);
 
-async function move(c:PoolClient,user:User,productId:string,type:string,quantity:number,notes?:string,supplierId?:string,purchasePrice?:number,referenceId?:string,businessDate?:string){const r=await c.query('SELECT * FROM products WHERE id=$1 FOR UPDATE',[productId]);if(!r.rowCount)throw error('NOT_FOUND','Product not found',404);const p=r.rows[0], reserve=type==='RESERVATION'||type==='RESERVATION_RELEASE'||type==='RESERVATION_CANCEL', newCurrent=p.current_quantity+(reserve?0:quantity),newReserved=p.reserved_quantity+(type==='RESERVATION'?quantity:(type==='RESERVATION_RELEASE'||type==='RESERVATION_CANCEL')?-quantity:0),movementPurchasePrice=purchasePrice??(type==='LOST'||type==='DESTROYED'?+p.purchase_price:undefined);if(newCurrent<0||newReserved<0||newReserved>newCurrent)throw error('INSUFFICIENT_STOCK',`Only ${p.current_quantity-p.reserved_quantity} units are available.`);await c.query('UPDATE products SET current_quantity=$1,reserved_quantity=$2,purchase_price=COALESCE($3,purchase_price),supplier_id=COALESCE($4,supplier_id),updated_at=now() WHERE id=$5',[newCurrent,newReserved,movementPurchasePrice,supplierId,productId]);await c.query('INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,supplier_id,purchase_price,business_date,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)',[productId,type,quantity,user.id,referenceId||null,supplierId||null,movementPurchasePrice||null,businessDate||null,notes||null]);return p;}
-async function releaseReservedStock(c:PoolClient,user:User,reservation:any,type:'RESERVATION_CANCEL'|'RESERVATION_RELEASE',notes?:string){const r=await c.query('SELECT * FROM products WHERE id=$1 FOR UPDATE',[reservation.product_id]);if(!r.rowCount)throw error('NOT_FOUND','Product not found',404);const p=r.rows[0],newReserved=p.reserved_quantity-reservation.quantity;if(newReserved<0)throw error('INVALID_RESERVATION','Reserved quantity is inconsistent with this reservation');await c.query('UPDATE products SET reserved_quantity=$1,updated_at=now() WHERE id=$2',[newReserved,p.id]);await c.query('INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,notes) VALUES($1,$2,$3,$4,$5,$6)',[reservation.product_id,type,-reservation.quantity,user.id,reservation.id,notes||null]);}
-app.post('/api/inventory/import',auth(),asyncRoute(async(req,res)=>{const x=z.object({productId:id,quantity:qty,purchasePrice:money,supplierId:id,importDate:z.string().regex(/^\d{4}-\d{2}-\d{2}$/,'Choose a valid import date'),notes:z.string().optional()}).parse(req.body);await tx(async c=>{await move(c,req.user!,x.productId,'IMPORT',x.quantity,x.notes,x.supplierId,x.purchasePrice,undefined,x.importDate);await audit(c,req.user!,'IMPORT','PRODUCT',x.productId,x);});res.status(201).json({ok:true});}));
-app.post('/api/inventory/adjust',auth(),asyncRoute(async(req,res)=>{const x=z.object({productId:id,quantity:qty,type:z.enum(['DESTROYED','LOST','RETURN','CORRECTION']),correctionDirection:z.enum(['INCREASE','DECREASE']).nullable().optional(),saleNumber:z.coerce.number().int().positive().optional(),notes:z.string().optional()}).parse(req.body);if(x.type==='CORRECTION'&&!x.correctionDirection)throw error('VALIDATION','Correction direction is required for a correction');if(['DESTROYED','LOST'].includes(x.type)&&!x.notes)throw error('VALIDATION','A note is required for this adjustment');if(x.type==='RETURN'&&!x.saleNumber)throw error('VALIDATION','Sale ID is required for a return');const result=await tx(async c=>{if(x.type==='RETURN'){const sale=await c.query('SELECT * FROM sales WHERE sale_number=$1 FOR UPDATE',[x.saleNumber]);if(!sale.rowCount)throw error('NOT_FOUND','Sale ID not found',404);const item=await c.query('SELECT * FROM sale_items WHERE sale_id=$1 AND product_id=$2 FOR UPDATE',[sale.rows[0].id,x.productId]);if(!item.rowCount)throw error('RETURN_NOT_SOLD','This product was not sold in that sale');const returned=await c.query("SELECT COALESCE(sum(quantity),0) quantity FROM stock_movements WHERE reference_id=$1 AND type='RETURN' AND deleted_at IS NULL",[item.rows[0].id]);if(+returned.rows[0].quantity+x.quantity>item.rows[0].quantity)throw error('RETURN_LIMIT','Returned quantity exceeds the quantity sold');const paid=await c.query('SELECT COALESCE(sum(amount),0) amount FROM sale_payments WHERE sale_id=$1',[sale.rows[0].id]);const refunded=await c.query('SELECT COALESCE(sum(amount),0) amount FROM sale_refunds WHERE sale_id=$1',[sale.rows[0].id]);const refundDue=+(+item.rows[0].final_unit_price*x.quantity).toFixed(2);const refund=Math.min(refundDue,Math.max(0,+paid.rows[0].amount-+refunded.rows[0].amount));const reason=x.notes||'Customer return';await move(c,req.user!,x.productId,'RETURN',x.quantity,reason,undefined,undefined,item.rows[0].id);if(refund>0)await c.query('INSERT INTO sale_refunds(sale_id,sale_item_id,amount,reason,created_by) VALUES($1,$2,$3,$4,$5)',[sale.rows[0].id,item.rows[0].id,refund,reason,req.user!.id]);const allItems=await c.query('SELECT si.quantity,COALESCE((SELECT sum(sm.quantity) FROM stock_movements sm WHERE sm.reference_id=si.id AND sm.type=\'RETURN\' AND sm.deleted_at IS NULL),0) returned FROM sale_items si WHERE si.sale_id=$1',[sale.rows[0].id]);const fully=allItems.rows.every((i:any)=>+i.returned>=+i.quantity);const any=allItems.rows.some((i:any)=>+i.returned>0);await c.query("UPDATE sales SET status=$1,updated_at=now() WHERE id=$2",[fully?'RETURNED':any?'PARTIALLY_RETURNED':'COMPLETED',sale.rows[0].id]);await audit(c,req.user!,'RETURN','SALE',sale.rows[0].id,{saleNumber:x.saleNumber,productId:x.productId,quantity:x.quantity,refund});return {ok:true,refund,saleNumber:x.saleNumber}}const signed=x.type==='CORRECTION'?(x.correctionDirection==='DECREASE'?-x.quantity:x.quantity):-x.quantity;await move(c,req.user!,x.productId,x.type,signed,x.notes);await audit(c,req.user!,x.type,'PRODUCT',x.productId,{...x,quantity:signed});return {ok:true}});res.status(201).json(result);}));
+app.get("/api/categories", auth(), listResource("categories", "*", false));
+app.post(
+  "/api/categories",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const x = z.object({ name: z.string().min(1) }).parse(req.body);
+    const r = await pool.query(
+      "INSERT INTO categories(name) VALUES($1) RETURNING *",
+      [x.name],
+    );
+    res.status(201).json(r.rows[0]);
+  }),
+);
+app.patch(
+  "/api/categories/:id",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const x = z
+      .object({
+        name: z.string().min(1).optional(),
+        isActive: z.boolean().optional(),
+      })
+      .parse(req.body);
+    const r = await pool.query(
+      "UPDATE categories SET name=COALESCE($1,name),is_active=COALESCE($2,is_active) WHERE id=$3 RETURNING *",
+      [x.name, x.isActive, id.parse(req.params.id)],
+    );
+    if (!r.rowCount) throw error("NOT_FOUND", "Category not found", 404);
+    res.json(r.rows[0]);
+  }),
+);
 
-app.get('/api/reservations',auth(),asyncRoute(async(_q,res)=>{const r=await pool.query("SELECT r.*,p.name product_name,c.name customer_name,s.name supplier_name,u.name employee_name,CASE WHEN r.status='ACTIVE' AND r.expires_at IS NOT NULL AND r.expires_at<now() THEN 'EXPIRED' ELSE r.status::text END display_status,(r.selling_price-r.deposit_paid) remaining FROM reservations r JOIN products p ON p.id=r.product_id LEFT JOIN customers c ON c.id=r.customer_id LEFT JOIN suppliers s ON s.id=r.supplier_id JOIN users u ON u.id=r.created_by ORDER BY r.created_at DESC");res.json(r.rows);}));
-app.post('/api/reservations',auth(),asyncRoute(async(req,res)=>{const x=z.object({productId:id,customerId:id.optional().nullable(),supplierId:id.optional().nullable(),quantity:qty,sellingPrice:money,depositPaid:money.default(0),expiresAt:z.string().datetime().optional().nullable(),notes:z.string().optional()}).parse(req.body);if(x.depositPaid>x.sellingPrice)throw error('VALIDATION','Deposit cannot exceed the negotiated price');const out=await tx(async c=>{const r=await c.query('INSERT INTO reservations(product_id,customer_id,supplier_id,quantity,selling_price,deposit_paid,created_by,expires_at,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',[x.productId,x.customerId,x.supplierId,x.quantity,x.sellingPrice,x.depositPaid,req.user!.id,x.expiresAt,x.notes]);await move(c,req.user!,x.productId,'RESERVATION',x.quantity,x.notes,undefined,undefined,r.rows[0].id);await audit(c,req.user!,'RESERVE','RESERVATION',r.rows[0].id,x);return r.rows[0]});res.status(201).json(out);}));
-app.post('/api/reservations/:id/release',auth(),asyncRoute(async(req,res)=>{const rid=id.parse(req.params.id);await tx(async c=>{const r=await c.query("SELECT * FROM reservations WHERE id=$1 FOR UPDATE",[rid]);if(!r.rowCount||r.rows[0].status!=='ACTIVE')throw error('INVALID_RESERVATION','Reservation is not active');const x=r.rows[0];await releaseReservedStock(c,req.user!,x,'RESERVATION_CANCEL',req.body.notes);await c.query("UPDATE reservations SET status='CANCELLED',updated_at=now() WHERE id=$1",[rid]);await audit(c,req.user!,'RESERVATION_CANCEL','RESERVATION',rid);});res.json({ok:true});}));
+app.get(
+  "/api/products",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const q = String(req.query.q || ""),
+      status = String(req.query.status || "active"),
+      out = req.query.out === "true";
+    const where: string[] = [];
+    const p: any[] = [];
+    if (q) {
+      p.push(`%${q}%`);
+      where.push(`p.name ILIKE $${p.length}`);
+    }
+    if (status !== "all") {
+      p.push(status === "active");
+      where.push(`p.is_active=$${p.length}`);
+    }
+    if (out) where.push("p.current_quantity=0");
+    const r = await pool.query(
+      `SELECT p.*,c.name category_name,s.name supplier_name,(p.current_quantity-p.reserved_quantity) available_quantity,(SELECT storage_path FROM product_images i WHERE i.product_id=p.id ORDER BY i.is_primary DESC,i.created_at LIMIT 1) primary_image FROM products p LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN suppliers s ON s.id=p.supplier_id ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY p.name`,
+      p,
+    );
+    res.json(r.rows);
+  }),
+);
+app.get(
+  "/api/products/:id",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const r = await pool.query(
+      "SELECT p.*,(p.current_quantity-p.reserved_quantity) available_quantity FROM products p WHERE p.id=$1",
+      [id.parse(req.params.id)],
+    );
+    if (!r.rowCount) throw error("NOT_FOUND", "Product not found", 404);
+    const images = await pool.query(
+      "SELECT * FROM product_images WHERE product_id=$1 ORDER BY is_primary DESC,created_at",
+      [r.rows[0].id],
+    );
+    res.json({ ...r.rows[0], images: images.rows });
+  }),
+);
+app.post(
+  "/api/products",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const x = productSchema.parse(req.body);
+    const product = await tx(async (c) => {
+      const r = await c.query(
+        "INSERT INTO products(name,category_id,supplier_id,description,purchase_price,selling_price,width,height,depth,material,color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *",
+        [
+          x.name,
+          x.categoryId,
+          x.supplierId,
+          x.description,
+          x.purchasePrice,
+          x.sellingPrice,
+          x.width,
+          x.height,
+          x.depth,
+          x.material,
+          x.color,
+        ],
+      );
+      await productEvent(c, req.user!, r.rows[0].id, "PRODUCT_CREATED");
+      await audit(c, req.user!, "CREATE", "PRODUCT", r.rows[0].id);
+      return r.rows[0];
+    });
+    res.status(201).json(product);
+  }),
+);
+app.patch(
+  "/api/products/:id",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const x = productSchema.partial().parse(req.body),
+      map: any = {
+        categoryId: "category_id",
+        supplierId: "supplier_id",
+        purchasePrice: "purchase_price",
+        sellingPrice: "selling_price",
+        isActive: "is_active",
+      };
+    const keys = Object.keys(x);
+    if (!keys.length) throw error("VALIDATION", "No changes supplied");
+    const vals = keys.map((k) => (x as any)[k]);
+    const product = await tx(async (c) => {
+      const r = await c.query(
+        `UPDATE products SET ${keys.map((k, i) => `${map[k] || k}=$${i + 1}`).join(",")},updated_at=now() WHERE id=$${keys.length + 1} RETURNING *`,
+        [...vals, id.parse(req.params.id)],
+      );
+      if (!r.rowCount) throw error("NOT_FOUND", "Product not found", 404);
+      await audit(c, req.user!, "UPDATE", "PRODUCT", r.rows[0].id, x);
+      return r.rows[0];
+    });
+    res.json(product);
+  }),
+);
+app.delete(
+  "/api/products/:id",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const productId = id.parse(req.params.id);
+    const result = await tx(async (c) => {
+      const product = await c.query(
+        "SELECT id,is_active FROM products WHERE id=$1 FOR UPDATE",
+        [productId],
+      );
+      if (!product.rowCount) throw error("NOT_FOUND", "Product not found", 404);
+      if (!product.rows[0].is_active)
+        return { archived: true, alreadyArchived: true, imagePaths: [] };
+      const history = await c.query(
+        "SELECT EXISTS(SELECT 1 FROM sale_items WHERE product_id=$1) OR EXISTS(SELECT 1 FROM stock_movements WHERE product_id=$1) OR EXISTS(SELECT 1 FROM reservations WHERE product_id=$1) AS has_history",
+        [productId],
+      );
+      if (history.rows[0].has_history) {
+        await c.query(
+          "UPDATE products SET is_active=false,updated_at=now() WHERE id=$1",
+          [productId],
+        );
+        await productEvent(c, req.user!, productId, "PRODUCT_ARCHIVED");
+        await audit(c, req.user!, "ARCHIVE", "PRODUCT", productId);
+        return { archived: true, imagePaths: [] as string[] };
+      }
+      const images = await c.query(
+        "SELECT storage_path FROM product_images WHERE product_id=$1",
+        [productId],
+      );
+      await productEvent(c, req.user!, productId, "PRODUCT_DELETED");
+      await c.query("DELETE FROM products WHERE id=$1", [productId]);
+      await audit(c, req.user!, "DELETE", "PRODUCT", productId);
+      return {
+        deleted: true,
+        imagePaths: images.rows.map((image) => image.storage_path as string),
+      };
+    });
+    await Promise.all(
+      result.imagePaths.map((storagePath) =>
+        fs.promises.unlink(path.join(uploadDir, storagePath)).catch(() => undefined),
+      ),
+    );
+    const { imagePaths: _imagePaths, ...response } = result;
+    res.json(response);
+  }),
+);
+const uploader = multer({
+  storage: multer.diskStorage({
+    destination: (_r, _f, cb) => cb(null, path.join(uploadDir, "products")),
+    filename: (_r, f, cb) =>
+      cb(null, `${randomUUID()}${path.extname(f.originalname).toLowerCase()}`),
+  }),
+  limits: { fileSize: 5 * 1024 * 1024, files: 5 },
+  fileFilter: (_r, f, cb) =>
+    cb(null, ["image/jpeg", "image/png", "image/webp"].includes(f.mimetype)),
+});
+app.post(
+  "/api/products/:id/images",
+  auth(["ADMIN"]),
+  uploader.single("image"),
+  asyncRoute(async (req, res) => {
+    if (!req.file)
+      throw error("INVALID_IMAGE", "Use JPG, PNG, or WebP up to 5 MB");
+    try {
+      const productId = id.parse(req.params.id);
+      const image = await tx(async (c) => {
+        const product = await c.query(
+          "SELECT id FROM products WHERE id=$1 FOR UPDATE",
+          [productId],
+        );
+        if (!product.rowCount)
+          throw error("NOT_FOUND", "Product not found", 404);
+        const count = await c.query(
+          "SELECT count(*) FROM product_images WHERE product_id=$1",
+          [productId],
+        );
+        if (+count.rows[0].count >= 5)
+          throw error("IMAGE_LIMIT", "Maximum 5 images per product");
+        const inserted = await c.query(
+          "INSERT INTO product_images(product_id,filename,storage_path,is_primary) VALUES($1,$2,$3,NOT EXISTS(SELECT 1 FROM product_images WHERE product_id=$1)) RETURNING *",
+          [productId, req.file!.filename, `products/${req.file!.filename}`],
+        );
+        return inserted.rows[0];
+      });
+      res.status(201).json(image);
+    } catch (uploadError) {
+      await fs.promises.unlink(req.file.path).catch(() => undefined);
+      throw uploadError;
+    }
+  }),
+);
+app.delete(
+  "/api/product-images/:id",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const imageId = id.parse(req.params.id);
+    const image = await tx(async (c) => {
+      const deleted = await c.query(
+        "DELETE FROM product_images WHERE id=$1 RETURNING product_id,storage_path,is_primary",
+        [imageId],
+      );
+      if (!deleted.rowCount) throw error("NOT_FOUND", "Image not found", 404);
+      if (deleted.rows[0].is_primary)
+        await c.query(
+          "UPDATE product_images SET is_primary=true WHERE id=(SELECT id FROM product_images WHERE product_id=$1 ORDER BY created_at LIMIT 1)",
+          [deleted.rows[0].product_id],
+        );
+      return deleted.rows[0];
+    });
+    await fs.promises
+      .unlink(path.join(uploadDir, image.storage_path))
+      .catch(() => undefined);
+    res.status(204).end();
+  }),
+);
+app.post(
+  "/api/product-images/:id/primary",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const r = await pool.query(
+      "SELECT product_id FROM product_images WHERE id=$1",
+      [id.parse(req.params.id)],
+    );
+    if (!r.rowCount) throw error("NOT_FOUND", "Image not found", 404);
+    await pool.query(
+      "UPDATE product_images SET is_primary=(id=$1) WHERE product_id=$2",
+      [req.params.id, r.rows[0].product_id],
+    );
+    res.json({ ok: true });
+  }),
+);
 
-const saleSchema=z.object({customerId:id.optional().nullable(),items:z.array(z.object({productId:id,supplierId:id.optional().nullable(),quantity:qty,finalUnitPrice:money.optional(),discountAmount:money.optional()})).min(1),payments:z.array(z.object({method:z.enum(['CASH','CARD','BANK_TRANSFER','OTHER']),amount:money.positive()})).default([]),notes:z.string().optional(),businessDate:z.string().regex(/^\d{4}-\d{2}-\d{2}$/,'Business date must use YYYY-MM-DD').optional(),deliveryRequired:z.boolean().default(false),deliveryAddress:z.string().optional(),deliveryDate:z.string().optional(),deliveryNotes:z.string().optional()});
-async function createSale(c:PoolClient,user:User,x:z.infer<typeof saleSchema>,reservationId?:string){let subtotal=0,discount=0;const items:any[]=[];for(const i of x.items){const p=await c.query('SELECT * FROM products WHERE id=$1 FOR UPDATE',[i.productId]);if(!p.rowCount)throw error('NOT_FOUND','Product not found',404);const product=p.rows[0];if(product.current_quantity-product.reserved_quantity<i.quantity&&!reservationId)throw error('INSUFFICIENT_STOCK',`Only ${product.current_quantity-product.reserved_quantity} units are available.`);const regular=+product.selling_price,final=i.finalUnitPrice??(regular-(i.discountAmount||0));if(final<0)throw error('VALIDATION','Final price cannot be negative');items.push({...i,regular,final,cost:+product.purchase_price,supplierId:i.supplierId??product.supplier_id});subtotal+=regular*i.quantity;discount+=(regular-final)*i.quantity;}const total=+(subtotal-discount).toFixed(2),paid=+x.payments.reduce((s,p)=>s+p.amount,0).toFixed(2);if(paid>total)throw error('PAYMENT_EXCEEDS_TOTAL','Payments cannot exceed sale total');const sale=await c.query("INSERT INTO sales(customer_id,employee_id,subtotal,discount_total,total,notes,business_date,delivery_required,delivery_address,delivery_date,delivery_notes,delivery_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *",[x.customerId,user.id,subtotal,discount,total,x.notes||null,x.businessDate||new Date().toISOString().slice(0,10),x.deliveryRequired,x.deliveryAddress||null,x.deliveryDate||null,x.deliveryNotes||null,x.deliveryRequired?'PENDING':'NOT_REQUIRED']);for(const i of items){await c.query('INSERT INTO sale_items(sale_id,product_id,supplier_id,quantity,regular_unit_price,discount_amount,final_unit_price,line_total,cost_price) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)',[sale.rows[0].id,i.productId,i.supplierId||null,i.quantity,i.regular,i.regular-i.final,i.final,i.final*i.quantity,i.cost]);if(reservationId)await releaseReservedStock(c,user,{product_id:i.productId,quantity:i.quantity,id:reservationId},'RESERVATION_RELEASE','Converted to sale');await move(c,user,i.productId,'SALE',-i.quantity,'Sale',undefined,undefined,sale.rows[0].id);}for(const payment of x.payments)await c.query('INSERT INTO sale_payments(sale_id,method,amount) VALUES($1,$2,$3)',[sale.rows[0].id,payment.method,payment.amount]);return sale.rows[0];}
-app.get('/api/sales',auth(),asyncRoute(async(req,res)=>{const q=String(req.query.q||''),r=await pool.query(`SELECT s.*,c.name customer_name,u.name employee_name,COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id),0) paid,COALESCE((SELECT json_agg(json_build_object('name',p.name,'quantity',si.quantity,'costPrice',si.cost_price,'salePrice',si.final_unit_price)) FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=s.id),'[]') items FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.employee_id ${q?'WHERE s.id::text ILIKE $1 OR c.name ILIKE $1':''} ORDER BY s.created_at DESC`,q?[`%${q}%`]:[]);res.json(r.rows.map(s=>({...s,remaining:+s.total-(+s.paid),paymentStatus:+s.paid===0?'UNPAID':+s.paid===+s.total?'PAID':'PARTIALLY_PAID'})));}));
-app.post('/api/sales',auth(),asyncRoute(async(req,res)=>{const x=saleSchema.parse(req.body);if(!x.businessDate)throw error('VALIDATION','Sale date is required');const out=await tx(async c=>{const sale=await createSale(c,req.user!,x);await audit(c,req.user!,'SALE','SALE',sale.id,{total:sale.total,businessDate:x.businessDate});return sale});res.status(201).json(out);}));
-app.get('/api/sales/:id',auth(),asyncRoute(async(req,res)=>{const sid=id.parse(req.params.id);const sale=await pool.query('SELECT s.*,c.name customer_name,u.name employee_name FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.employee_id WHERE s.id=$1',[sid]);if(!sale.rowCount)throw error('NOT_FOUND','Sale not found',404);const [items,payments]=await Promise.all([pool.query('SELECT si.*,p.name product_name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE sale_id=$1',[sid]),pool.query('SELECT * FROM sale_payments WHERE sale_id=$1',[sid])]);res.json({...sale.rows[0],items:items.rows,payments:payments.rows});}));
-app.put('/api/sales/:id/paid',auth(),asyncRoute(async(req,res)=>{const saleId=id.parse(req.params.id);const x=z.object({paid:money,method:z.enum(['CASH','CARD','BANK_TRANSFER','OTHER']).default('CASH')}).parse(req.body);const result=await tx(async c=>{const sale=await c.query('SELECT total FROM sales WHERE id=$1 FOR UPDATE',[saleId]);if(!sale.rowCount)throw error('NOT_FOUND','Sale not found',404);const paid=await c.query('SELECT COALESCE(sum(amount),0) total FROM sale_payments WHERE sale_id=$1',[saleId]);const current=+paid.rows[0].total,total=+sale.rows[0].total;if(x.paid>total)throw error('PAYMENT_EXCEEDS_TOTAL','Paid amount cannot exceed the sale total');if(x.paid<current)throw error('PAYMENT_REDUCTION_NOT_ALLOWED','Paid amount cannot be reduced because payment history is preserved');const difference=+(x.paid-current).toFixed(2);if(difference>0)await c.query('INSERT INTO sale_payments(sale_id,method,amount) VALUES($1,$2,$3)',[saleId,x.method,difference]);await audit(c,req.user!,'ADD_PAYMENT','SALE',saleId,{amount:difference,paid:x.paid,method:x.method});return {paid:x.paid,remaining:total-x.paid,paymentStatus:x.paid===0?'UNPAID':x.paid===total?'PAID':'PARTIALLY_PAID'}});res.json(result);}));
-app.put('/api/sales/:id/delivery',auth(),asyncRoute(async(req,res)=>{const saleId=id.parse(req.params.id);const result=await tx(async c=>{const sale=await c.query('SELECT id,total,status,delivery_status FROM sales WHERE id=$1 FOR UPDATE',[saleId]);if(!sale.rowCount)throw error('NOT_FOUND','Sale not found',404);if(sale.rows[0].status!=='COMPLETED')throw error('INVALID_DELIVERY','Only completed sales can be taken out');const paid=await c.query('SELECT COALESCE(sum(amount),0) amount FROM sale_payments WHERE sale_id=$1',[saleId]);if(+paid.rows[0].amount<+sale.rows[0].total)throw error('PAYMENT_REQUIRED','The final sale amount must be fully paid before takeout');const current=sale.rows[0].delivery_status,next=current==='TAKEN_OUT'?'IN_TRANSIT':current==='IN_TRANSIT'?'DELIVERED':current==='DELIVERED'?'DELIVERED':'TAKEN_OUT';await c.query('UPDATE sales SET delivery_required=true,delivery_status=$1,updated_at=now() WHERE id=$2',[next,saleId]);await audit(c,req.user!,next,'SALE',saleId);return {deliveryStatus:next}});res.json(result);}));
-app.post('/api/sales/:id/returns',auth(),asyncRoute(async(req,res)=>{const sid=id.parse(req.params.id);const x=z.object({items:z.array(z.object({saleItemId:id,quantity:qty})).min(1),reason:z.string().min(1)}).parse(req.body);await tx(async c=>{for(const item of x.items){const it=await c.query('SELECT * FROM sale_items WHERE id=$1 AND sale_id=$2 FOR UPDATE',[item.saleItemId,sid]);if(!it.rowCount)throw error('NOT_FOUND','Sale item not found',404);const returned=await c.query("SELECT COALESCE(sum(quantity),0) n FROM stock_movements WHERE reference_id=$1 AND type='RETURN'",[item.saleItemId]);if(+returned.rows[0].n+item.quantity>it.rows[0].quantity)throw error('RETURN_LIMIT','Cannot return more than sold');await move(c,req.user!,it.rows[0].product_id,'RETURN',item.quantity,x.reason,undefined,undefined,item.saleItemId);}await audit(c,req.user!,'RETURN','SALE',sid,{reason:x.reason});});res.json({ok:true});}));
-app.post('/api/reservations/:id/complete',auth(),asyncRoute(async(req,res)=>{const rid=id.parse(req.params.id);const out=await tx(async c=>{const r=await c.query('SELECT * FROM reservations WHERE id=$1 FOR UPDATE',[rid]);if(!r.rowCount||r.rows[0].status!=='ACTIVE')throw error('INVALID_RESERVATION','Reservation is not active');const reservation=r.rows[0];if(reservation.selling_price===null)throw error('VALIDATION','This reservation has no selling price and cannot be marked sold');const x={customerId:reservation.customer_id,items:[{productId:reservation.product_id,supplierId:reservation.supplier_id,quantity:reservation.quantity,finalUnitPrice:+reservation.selling_price}],payments:+reservation.deposit_paid>0?[{method:'CASH' as const,amount:+reservation.deposit_paid}]:[],notes:reservation.notes||undefined,deliveryRequired:false};const sale=await createSale(c,req.user!,x,rid);await c.query("UPDATE reservations SET status='COMPLETED',updated_at=now() WHERE id=$1",[rid]);await audit(c,req.user!,'COMPLETE_RESERVATION','RESERVATION',rid,{saleId:sale.id,depositPaid:reservation.deposit_paid});return sale});res.status(201).json(out);}));
+async function move(
+  c: PoolClient,
+  user: User,
+  productId: string,
+  type: string,
+  quantity: number,
+  notes?: string,
+  supplierId?: string,
+  purchasePrice?: number,
+  referenceId?: string,
+  businessDate?: string,
+) {
+  const r = await c.query("SELECT * FROM products WHERE id=$1 FOR UPDATE", [
+    productId,
+  ]);
+  if (!r.rowCount) throw error("NOT_FOUND", "Product not found", 404);
+  const p = r.rows[0],
+    reserve =
+      type === "RESERVATION" ||
+      type === "RESERVATION_RELEASE" ||
+      type === "RESERVATION_CANCEL",
+    newCurrent = p.current_quantity + (reserve ? 0 : quantity),
+    newReserved =
+      p.reserved_quantity +
+      (type === "RESERVATION"
+        ? quantity
+        : type === "RESERVATION_RELEASE" || type === "RESERVATION_CANCEL"
+          ? -quantity
+          : 0),
+    movementPurchasePrice =
+      purchasePrice ??
+      (type === "LOST" || type === "DESTROYED" ? +p.purchase_price : undefined);
+  if (newCurrent < 0 || newReserved < 0 || newReserved > newCurrent)
+    throw error(
+      "INSUFFICIENT_STOCK",
+      `Only ${p.current_quantity - p.reserved_quantity} units are available.`,
+    );
+  await c.query(
+    "UPDATE products SET current_quantity=$1,reserved_quantity=$2,purchase_price=COALESCE($3,purchase_price),supplier_id=COALESCE($4,supplier_id),updated_at=now() WHERE id=$5",
+    [newCurrent, newReserved, movementPurchasePrice, supplierId, productId],
+  );
+  const movement = await c.query(
+    "INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,supplier_id,purchase_price,business_date,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *",
+    [
+      productId,
+      type,
+      quantity,
+      user.id,
+      referenceId || null,
+      supplierId || null,
+      movementPurchasePrice ?? null,
+      businessDate || null,
+      notes || null,
+    ],
+  );
+  return { product: p, movement: movement.rows[0] };
+}
+async function releaseReservedStock(
+  c: PoolClient,
+  user: User,
+  reservation: any,
+  type: "RESERVATION_CANCEL" | "RESERVATION_RELEASE",
+  notes?: string,
+) {
+  const r = await c.query("SELECT * FROM products WHERE id=$1 FOR UPDATE", [
+    reservation.product_id,
+  ]);
+  if (!r.rowCount) throw error("NOT_FOUND", "Product not found", 404);
+  const p = r.rows[0],
+    newReserved = p.reserved_quantity - reservation.quantity;
+  if (newReserved < 0)
+    throw error(
+      "INVALID_RESERVATION",
+      "Reserved quantity is inconsistent with this reservation",
+    );
+  await c.query(
+    "UPDATE products SET reserved_quantity=$1,updated_at=now() WHERE id=$2",
+    [newReserved, p.id],
+  );
+  await c.query(
+    "INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,notes) VALUES($1,$2,$3,$4,$5,$6)",
+    [
+      reservation.product_id,
+      type,
+      -reservation.quantity,
+      user.id,
+      reservation.id,
+      notes || null,
+    ],
+  );
+}
 
-app.get('/api/stock-movements',auth(),asyncRoute(async(req,res)=>{const p:string[]=[];const where:string[]=[];for(const [field,col] of [['productId','sm.product_id'],['userId','sm.user_id'],['type','sm.type']] as const){if(req.query[field]){p.push(String(req.query[field]));where.push(`${col}=$${p.length}`)}}if(req.query.from){p.push(String(req.query.from));where.push(`COALESCE(sm.business_date,sm.created_at::date) >= $${p.length}::date`)}if(req.query.to){p.push(String(req.query.to));where.push(`COALESCE(sm.business_date,sm.created_at::date) <= $${p.length}::date`)}const r=await pool.query(`SELECT sm.*,(SELECT si.final_unit_price FROM sale_items si WHERE si.sale_id=sm.reference_id AND si.product_id=sm.product_id LIMIT 1) sale_selling_price,COALESCE(sm.business_date,sm.created_at::date) display_date,p.name product_name,u.name employee_name,s.name supplier_name,cu.name customer_name,du.name deleted_by_name FROM stock_movements sm JOIN products p ON p.id=sm.product_id JOIN users u ON u.id=sm.user_id LEFT JOIN suppliers s ON s.id=sm.supplier_id LEFT JOIN sales sa ON sa.id=sm.reference_id LEFT JOIN customers cu ON cu.id=sa.customer_id LEFT JOIN users du ON du.id=sm.deleted_by ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY COALESCE(sm.business_date,sm.created_at::date) DESC,sm.created_at DESC LIMIT 500`,p);const events=await pool.query("SELECT e.id,e.product_id,e.product_name,e.action type,NULL::integer quantity,NULL::numeric purchase_price,NULL::numeric sale_selling_price,e.created_at,e.created_at::date display_date,u.name employee_name,NULL::text supplier_name,NULL::text customer_name,NULL::uuid reference_id,e.notes,NULL::timestamptz deleted_at FROM product_events e JOIN users u ON u.id=e.user_id");res.json([...r.rows,...events.rows].sort((a,b)=>new Date(b.display_date||b.created_at).getTime()-new Date(a.display_date||a.created_at).getTime()));}));
-app.delete('/api/stock-movements/:id',auth(),asyncRoute(async(req,res)=>{const movementId=id.parse(req.params.id);const reason=z.object({reason:z.string().min(3)}).parse(req.body).reason;const result=await tx(async c=>{const movement=await c.query('SELECT * FROM stock_movements WHERE id=$1 FOR UPDATE',[movementId]);if(!movement.rowCount)throw error('NOT_FOUND','Inventory operation not found',404);const m=movement.rows[0];if(m.deleted_at)throw error('ALREADY_DELETED','This inventory operation has already been reversed');if(!['IMPORT','RETURN','LOST','DESTROYED','CORRECTION'].includes(m.type))throw error('CANNOT_REVERSE','Sales and reservations must be handled through their dedicated workflows');const product=await c.query('SELECT * FROM products WHERE id=$1 FOR UPDATE',[m.product_id]);const p=product.rows[0],newCurrent=p.current_quantity-m.quantity;if(newCurrent<0||newCurrent<p.reserved_quantity)throw error('CANNOT_REVERSE','This operation cannot be reversed because it would invalidate current stock or reservations');await c.query('UPDATE products SET current_quantity=$1,updated_at=now() WHERE id=$2',[newCurrent,p.id]);await c.query("UPDATE stock_movements SET deleted_at=now(),deleted_by=$1,deletion_reason=$2,notes=CASE WHEN notes IS NULL OR notes='' THEN $2 ELSE notes || ' | Reversal reason: ' || $2 END WHERE id=$3",[req.user!.id,reason,movementId]);await c.query("INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,supplier_id,purchase_price,notes) VALUES($1,'REVERSED',$2,$3,$4,$5,$6,$7)",[m.product_id,-m.quantity,req.user!.id,m.id,m.supplier_id,m.purchase_price,reason]);await audit(c,req.user!,'REVERSE_MOVEMENT','STOCK_MOVEMENT',movementId,{reason,originalQuantity:m.quantity});return {ok:true}});res.json(result);}));
-app.get('/api/customers/:id/history',auth(),asyncRoute(async(req,res)=>{const cid=id.parse(req.params.id);const c=await pool.query('SELECT * FROM customers WHERE id=$1',[cid]);if(!c.rowCount)throw error('NOT_FOUND','Customer not found',404);const sales=await pool.query("SELECT s.*,COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id),0) paid FROM sales s WHERE customer_id=$1 ORDER BY created_at DESC",[cid]);res.json({customer:c.rows[0],sales:sales.rows,totalSpent:sales.rows.reduce((a,s)=>a+(+s.total),0)});}));
+async function expireReservations() {
+  const candidates = await pool.query(
+    "SELECT id FROM reservations WHERE status='ACTIVE' AND expires_at IS NOT NULL AND expires_at<now()",
+  );
+  for (const candidate of candidates.rows) {
+    await tx(async (c) => {
+      const result = await c.query(
+        `SELECT r.*,u.name,u.username,u.role
+         FROM reservations r
+         JOIN users u ON u.id=r.created_by
+         WHERE r.id=$1
+         FOR UPDATE OF r`,
+        [candidate.id],
+      );
+      const reservation = result.rows[0];
+      if (
+        !reservation ||
+        reservation.status !== "ACTIVE" ||
+        !reservation.expires_at ||
+        new Date(reservation.expires_at) >= new Date()
+      )
+        return;
+      const user: User = {
+        id: reservation.created_by,
+        name: reservation.name,
+        username: reservation.username,
+        role: reservation.role,
+      };
+      await releaseReservedStock(
+        c,
+        user,
+        reservation,
+        "RESERVATION_CANCEL",
+        "Reservation expired",
+      );
+      await c.query(
+        "UPDATE reservations SET status='EXPIRED',updated_at=now() WHERE id=$1",
+        [reservation.id],
+      );
+      await audit(
+        c,
+        user,
+        "RESERVATION_EXPIRE",
+        "RESERVATION",
+        reservation.id,
+      );
+    });
+  }
+}
 
-app.get('/api/dashboard',auth(),asyncRoute(async(_q,res)=>{const r=await pool.query("SELECT (SELECT count(*) FROM products WHERE is_active) products,(SELECT COALESCE(sum(current_quantity-reserved_quantity),0) FROM products WHERE is_active) available,(SELECT COALESCE(sum(reserved_quantity),0) FROM products) reserved,(SELECT count(*) FROM products WHERE current_quantity=0 AND is_active) out_stock,(SELECT COALESCE(sum(total),0) FROM sales WHERE created_at::date=current_date AND status='COMPLETED') today_revenue,(SELECT COALESCE(sum(total),0) FROM sales WHERE date_trunc('month',created_at)=date_trunc('month',now()) AND status='COMPLETED') month_revenue,(SELECT count(*) FROM customers) customers");const top=await pool.query("SELECT p.name,sum(si.quantity) quantity FROM sale_items si JOIN products p ON p.id=si.product_id JOIN sales s ON s.id=si.sale_id WHERE s.status='COMPLETED' GROUP BY p.id,p.name ORDER BY quantity DESC LIMIT 5");const trend=await pool.query("SELECT to_char(created_at::date,'YYYY-MM-DD') date,sum(total) revenue FROM sales WHERE created_at>=current_date-interval '30 days' GROUP BY created_at::date ORDER BY date");res.json({...r.rows[0],topProducts:top.rows,salesTrend:trend.rows});}));
-app.get('/api/inventory/summary',auth(),asyncRoute(async(_q,res)=>{const r=await pool.query("SELECT COALESCE(sum(current_quantity),0) physical_stock,COALESCE(sum(reserved_quantity),0) reserved,COALESCE(sum(current_quantity-reserved_quantity),0) available,COALESCE(sum(current_quantity*purchase_price),0) cost_value FROM products WHERE is_active");res.json(r.rows[0]);}));
-app.get('/api/inventory/movements',auth(),asyncRoute(async(req,res)=>{const values:any[]=[],where:string[]=[];const add=(sql:string,value:any)=>{values.push(value);where.push(sql.replace('?',`$${values.length}`))};if(req.query.productId)add('sm.product_id=?',String(req.query.productId));if(req.query.supplierId)add('sm.supplier_id=?',String(req.query.supplierId));if(req.query.type)add('sm.type=?',String(req.query.type));if(req.query.status==='ACTIVE')where.push('sm.deleted_at IS NULL');if(req.query.status==='REVERSED')where.push("(sm.deleted_at IS NOT NULL OR sm.type='REVERSED')");if(req.query.from)add('COALESCE(sm.business_date,sm.created_at::date)>=?::date',String(req.query.from));if(req.query.to)add('COALESCE(sm.business_date,sm.created_at::date)<=?::date',String(req.query.to));const r=await pool.query(`SELECT sm.*,COALESCE(sm.business_date,sm.created_at::date) display_date,p.name product_name,u.name employee_name,s.name supplier_name FROM stock_movements sm JOIN products p ON p.id=sm.product_id JOIN users u ON u.id=sm.user_id LEFT JOIN suppliers s ON s.id=sm.supplier_id ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY COALESCE(sm.business_date,sm.created_at::date) DESC,sm.created_at DESC LIMIT 500`,values);res.json(r.rows);}));
-app.get('/api/deliveries',auth(),asyncRoute(async(req,res)=>{const filter=String(req.query.status||'ALL');const r=await pool.query("SELECT s.*,c.name customer_name,c.phone customer_phone,COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id),0) paid,COALESCE((SELECT json_agg(json_build_object('name',p.name,'quantity',si.quantity)) FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.sale_id=s.id),'[]') items FROM sales s LEFT JOIN customers c ON c.id=s.customer_id WHERE (s.delivery_status IN ('TAKEN_OUT','IN_TRANSIT','DELIVERED') OR (s.status='COMPLETED' AND COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id),0)>=s.total)) ORDER BY s.business_date DESC,s.created_at DESC");const rows=r.rows.map(s=>({...s,delivery_view_status:['TAKEN_OUT','IN_TRANSIT','DELIVERED'].includes(s.delivery_status)?s.delivery_status:'READY'})).filter(s=>filter==='ALL'||s.delivery_view_status===filter);res.json(rows);}));
-app.put('/api/deliveries/:id/delivered',auth(),asyncRoute(async(req,res)=>{const saleId=id.parse(req.params.id);const r=await pool.query("UPDATE sales SET delivery_status='DELIVERED',delivery_required=true,updated_at=now() WHERE id=$1 AND delivery_status='IN_TRANSIT' RETURNING id,delivery_status",[saleId]);if(!r.rowCount)throw error('INVALID_DELIVERY','Only in-transit deliveries can be marked delivered');res.json(r.rows[0]);}));
-app.get('/api/payments',auth(),asyncRoute(async(req,res)=>{const filter=String(req.query.status||'OUTSTANDING');const r=await pool.query("SELECT s.id,s.sale_number,s.business_date,s.total,c.name customer_name,c.phone customer_phone,COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id),0) paid FROM sales s LEFT JOIN customers c ON c.id=s.customer_id WHERE s.status IN ('COMPLETED','PARTIALLY_RETURNED') ORDER BY s.business_date DESC,s.created_at DESC");const rows=r.rows.map(s=>({...s,remaining:+s.total-(+s.paid),payment_status:+s.paid===0?'UNPAID':+s.paid>=+s.total?'PAID':'PARTIALLY_PAID'})).filter(s=>filter==='ALL'?true:filter==='OUTSTANDING'?s.remaining>0:filter==='PAID'?s.remaining<=0:true);res.json(rows);}));
-app.get('/api/reports',auth(['ADMIN']),asyncRoute(async(req,res)=>{const period=z.enum(['MONTH','QUARTER','YEAR']).catch('MONTH').parse(String(req.query.period||'MONTH'));const now=new Date(),month=now.getMonth(),year=now.getFullYear(),startMonth=period==='MONTH'?month:period==='QUARTER'?Math.floor(month/3)*3:0,endYear=period==='YEAR'?year+1:period==='QUARTER'&&startMonth===9?year+1:year,endMonth=period==='YEAR'?0:period==='MONTH'?month+1:(startMonth+3)%12;const from=new Date(year,startMonth,1).toISOString().slice(0,10),to=new Date(endYear,endMonth,1).toISOString().slice(0,10);const [sales,imports,losses,returns,refunds,mostReturned,supplierEarnings,mostSold,inTransit]=await Promise.all([pool.query("SELECT COALESCE(sum(s.total-COALESCE(r.refund,0)),0) revenue,count(*) FILTER(WHERE COALESCE(pay.paid,0)>=s.total AND s.status='COMPLETED') paid_closed_sales FROM sales s LEFT JOIN LATERAL(SELECT sum(amount) paid FROM sale_payments WHERE sale_id=s.id) pay ON true LEFT JOIN LATERAL(SELECT sum(amount) refund FROM sale_refunds WHERE sale_id=s.id) r ON true WHERE s.business_date>=$1::date AND s.business_date<$2::date",[from,to]),pool.query("SELECT COALESCE(sum(sm.quantity*sm.purchase_price),0) cost FROM stock_movements sm WHERE sm.type='IMPORT' AND sm.deleted_at IS NULL AND COALESCE(sm.business_date,sm.created_at::date)>=$1::date AND COALESCE(sm.business_date,sm.created_at::date)<$2::date",[from,to]),pool.query("SELECT COALESCE(sum(abs(sm.quantity)*COALESCE(sm.purchase_price,0)),0) amount FROM stock_movements sm WHERE sm.type IN ('LOST','DESTROYED') AND sm.deleted_at IS NULL AND COALESCE(sm.business_date,sm.created_at::date)>=$1::date AND COALESCE(sm.business_date,sm.created_at::date)<$2::date",[from,to]),pool.query("SELECT COALESCE(sum(sm.quantity),0) quantity FROM stock_movements sm WHERE sm.type='RETURN' AND sm.deleted_at IS NULL AND COALESCE(sm.business_date,sm.created_at::date)>=$1::date AND COALESCE(sm.business_date,sm.created_at::date)<$2::date",[from,to]),pool.query("SELECT COALESCE(sum(amount),0) amount FROM sale_refunds WHERE created_at>=$1::date AND created_at<$2::date",[from,to]),pool.query("SELECT p.name,COALESCE(sum(sm.quantity),0) quantity FROM stock_movements sm JOIN products p ON p.id=sm.product_id WHERE sm.type='RETURN' AND sm.deleted_at IS NULL AND COALESCE(sm.business_date,sm.created_at::date)>=$1::date AND COALESCE(sm.business_date,sm.created_at::date)<$2::date GROUP BY p.id,p.name ORDER BY quantity DESC,p.name LIMIT 1",[from,to]),pool.query("SELECT COALESCE(sup.name,'Unassigned') supplier_name,COALESCE(sum(si.line_total-COALESCE(ref.refund,0)),0) revenue,COALESCE(sum(si.quantity),0) quantity FROM sales s JOIN sale_items si ON si.sale_id=s.id LEFT JOIN suppliers sup ON sup.id=si.supplier_id LEFT JOIN LATERAL(SELECT sum(amount) refund FROM sale_refunds WHERE sale_item_id=si.id) ref ON true WHERE s.business_date>=$1::date AND s.business_date<$2::date GROUP BY sup.id,sup.name ORDER BY revenue DESC,supplier_name",[from,to]),pool.query("SELECT p.name,COALESCE(sum(si.quantity-COALESCE(ret.quantity,0)),0) quantity FROM sales s JOIN sale_items si ON si.sale_id=s.id JOIN products p ON p.id=si.product_id LEFT JOIN LATERAL(SELECT sum(sm.quantity) quantity FROM stock_movements sm WHERE sm.type='RETURN' AND sm.deleted_at IS NULL AND sm.reference_id=si.id) ret ON true WHERE s.business_date>=$1::date AND s.business_date<$2::date GROUP BY p.id,p.name ORDER BY quantity DESC,p.name LIMIT 1",[from,to]),pool.query("SELECT count(*) count FROM sales WHERE delivery_status='IN_TRANSIT'")]);res.json({period,from,to,metrics:{revenue:+sales.rows[0].revenue,importCost:+imports.rows[0].cost,lossAmount:+losses.rows[0].amount,returnedQuantity:+returns.rows[0].quantity,refundedAmount:+refunds.rows[0].amount,paidClosedSales:+sales.rows[0].paid_closed_sales,inTransit:+inTransit.rows[0].count},mostReturnedProduct:mostReturned.rows[0]||null,mostSoldProduct:mostSold.rows[0]||null,supplierEarnings:supplierEarnings.rows});}));
+type SaleReturnItem = { saleItemId: string; quantity: number };
 
-app.get('/api/users',auth(['ADMIN']),asyncRoute(async(_q,res)=>{const r=await pool.query('SELECT id,name,username,role,is_active,last_login,created_at FROM users ORDER BY created_at');res.json(r.rows);}));
-app.post('/api/users',auth(['ADMIN']),asyncRoute(async(req,res)=>{const x=z.object({name:z.string().min(1),username:z.string().min(3),password:z.string().min(8),role:z.enum(['ADMIN','EMPLOYEE']).default('EMPLOYEE')}).parse(req.body);const r=await pool.query('INSERT INTO users(name,username,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id,name,username,role,is_active,created_at',[x.name,x.username,await bcrypt.hash(x.password,12),x.role]);res.status(201).json(r.rows[0]);}));
-app.put('/api/users/:id/password',auth(['ADMIN']),asyncRoute(async(req,res)=>{const userId=id.parse(req.params.id),x=z.object({newPassword:z.string().min(8),confirmPassword:z.string().min(8)}).parse(req.body);if(x.newPassword!==x.confirmPassword)throw error('PASSWORD_MISMATCH','New password and confirmation must match');await tx(async c=>{const employee=await c.query('SELECT id,role FROM users WHERE id=$1 FOR UPDATE',[userId]);if(!employee.rowCount)throw error('NOT_FOUND','Employee not found',404);if(employee.rows[0].role!=='EMPLOYEE')throw error('PASSWORD_RESET_RESTRICTED','Only employee passwords can be reset');await c.query('UPDATE users SET password_hash=$1 WHERE id=$2',[await bcrypt.hash(x.newPassword,12),userId]);await audit(c,req.user!,'RESET_EMPLOYEE_PASSWORD','USER',userId);});res.json({ok:true});}));
-app.patch('/api/users/:id',auth(['ADMIN']),asyncRoute(async(req,res)=>{const x=z.object({name:z.string().min(1).optional(),role:z.enum(['ADMIN','EMPLOYEE']).optional(),isActive:z.boolean().optional()}).parse(req.body);const r=await pool.query('UPDATE users SET name=COALESCE($1,name),role=COALESCE($2,role),is_active=COALESCE($3,is_active) WHERE id=$4 RETURNING id,name,username,role,is_active,last_login,created_at',[x.name,x.role,x.isActive,id.parse(req.params.id)]);if(!r.rowCount)throw error('NOT_FOUND','Employee not found',404);res.json(r.rows[0]);}));
-app.get('/api/audit-logs',auth(['ADMIN']),asyncRoute(async(_q,res)=>{const r=await pool.query('SELECT a.*,u.name user_name FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500');res.json(r.rows);}));
-app.get('/api/settings',auth(),asyncRoute(async(_q,res)=>res.json((await pool.query('SELECT * FROM settings')).rows)));
-app.put('/api/settings',auth(['ADMIN']),asyncRoute(async(req,res)=>{const x=z.record(z.string().max(200)).parse(req.body);await tx(async c=>{for(const [k,v] of Object.entries(x))await c.query('INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value',[k,v])});res.json({ok:true});}));
-app.use((_req,_res,next)=>next(error('NOT_FOUND','Route not found',404)));app.use((e:any,_req:Request,res:Response,_next:NextFunction)=>{if(e instanceof z.ZodError)return res.status(400).json({error:{code:'VALIDATION',message:e.issues.map(i=>i.message).join('; ')}});if(e.code==='23505')return res.status(409).json({error:{code:'DUPLICATE',message:'A record with that value already exists'}});console.error(e);res.status(e.status||500).json({error:{code:e.code||'SERVER_ERROR',message:e.status?e.message:'An unexpected server error occurred'}})});
-app.listen(+process.env.PORT!||4000,'0.0.0.0',()=>console.log('API listening'));
+async function processSaleReturn(
+  c: PoolClient,
+  user: User,
+  saleId: string,
+  items: SaleReturnItem[],
+  reason: string,
+) {
+  const sale = await c.query(
+    "SELECT id,sale_number,status,delivery_status FROM sales WHERE id=$1 FOR UPDATE",
+    [saleId],
+  );
+  if (!sale.rowCount) throw error("NOT_FOUND", "Sale not found", 404);
+  if (sale.rows[0].status === "CANCELLED")
+    throw error("INVALID_RETURN", "Cancelled sales cannot be returned");
+
+  const [paidResult, refundedResult] = await Promise.all([
+    c.query(
+      "SELECT COALESCE(sum(amount),0) amount FROM sale_payments WHERE sale_id=$1",
+      [saleId],
+    ),
+    c.query(
+      "SELECT COALESCE(sum(amount),0) amount FROM sale_refunds WHERE sale_id=$1",
+      [saleId],
+    ),
+  ]);
+  let refundable = Math.max(
+    0,
+    +paidResult.rows[0].amount - +refundedResult.rows[0].amount,
+  );
+  let totalRefund = 0;
+  const notes: string[] = [];
+
+  for (const requested of items) {
+    const item = await c.query(
+      "SELECT si.*,p.name product_name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE si.id=$1 AND si.sale_id=$2 FOR UPDATE OF si",
+      [requested.saleItemId, saleId],
+    );
+    if (!item.rowCount) throw error("NOT_FOUND", "Sale item not found", 404);
+
+    const returned = await c.query(
+      "SELECT COALESCE(sum(quantity),0) quantity FROM stock_movements WHERE reference_id=$1 AND type='RETURN' AND deleted_at IS NULL",
+      [requested.saleItemId],
+    );
+    if (+returned.rows[0].quantity + requested.quantity > item.rows[0].quantity)
+      throw error("RETURN_LIMIT", "Cannot return more than was sold");
+
+    await move(
+      c,
+      user,
+      item.rows[0].product_id,
+      "RETURN",
+      requested.quantity,
+      reason,
+      undefined,
+      undefined,
+      requested.saleItemId,
+    );
+
+    const refundDue = +(
+      +item.rows[0].final_unit_price * requested.quantity
+    ).toFixed(2);
+    const refund = Math.min(refundDue, refundable);
+    if (refund > 0) {
+      await c.query(
+        "INSERT INTO sale_refunds(sale_id,sale_item_id,amount,reason,created_by) VALUES($1,$2,$3,$4,$5)",
+        [saleId, requested.saleItemId, refund, reason, user.id],
+      );
+      refundable = +(refundable - refund).toFixed(2);
+      totalRefund = +(totalRefund + refund).toFixed(2);
+    }
+    notes.push(
+      formatReturnNote(
+        item.rows[0].product_name,
+        requested.quantity,
+        reason,
+      ),
+    );
+  }
+
+  const allItems = await c.query(
+    "SELECT si.quantity,COALESCE((SELECT sum(sm.quantity) FROM stock_movements sm WHERE sm.reference_id=si.id AND sm.type='RETURN' AND sm.deleted_at IS NULL),0) returned FROM sale_items si WHERE si.sale_id=$1",
+    [saleId],
+  );
+  const saleStatus = returnStatus(
+    allItems.rows.map((item) => ({
+      quantity: +item.quantity,
+      returned: +item.returned,
+    })),
+  );
+  const returnedBeforeDelivery = !["IN_TRANSIT", "DELIVERED"].includes(
+    sale.rows[0].delivery_status,
+  );
+  await c.query(
+    "UPDATE sales SET status=$1,notes=CASE WHEN notes IS NULL OR btrim(notes)='' THEN $2 ELSE notes || E'\\n' || $2 END,delivery_status=CASE WHEN $3 THEN 'CANCELLED' ELSE delivery_status END,delivery_required=CASE WHEN $3 THEN false ELSE delivery_required END,updated_at=now() WHERE id=$4",
+    [saleStatus, notes.join("\n"), returnedBeforeDelivery, saleId],
+  );
+  await audit(c, user, "RETURN", "SALE", saleId, {
+    saleNumber: sale.rows[0].sale_number,
+    items,
+    refund: totalRefund,
+    notes: reason,
+    deliveryCancelled: returnedBeforeDelivery,
+  });
+
+  return {
+    refund: totalRefund,
+    saleNumber: +sale.rows[0].sale_number,
+    saleStatus,
+    deliveryStatus: returnedBeforeDelivery
+      ? "CANCELLED"
+      : sale.rows[0].delivery_status,
+  };
+}
+
+app.post(
+  "/api/inventory/import",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const x = z
+      .object({
+        productId: id,
+        quantity: qty,
+        purchasePrice: money,
+        supplierId: id,
+        importDate: dateOnly,
+        notes: z.string().optional(),
+      })
+      .parse(req.body);
+    await tx(async (c) => {
+      await move(
+        c,
+        req.user!,
+        x.productId,
+        "IMPORT",
+        x.quantity,
+        x.notes,
+        x.supplierId,
+        x.purchasePrice,
+        undefined,
+        x.importDate,
+      );
+      await audit(c, req.user!, "IMPORT", "PRODUCT", x.productId, x);
+    });
+    res.status(201).json({ ok: true });
+  }),
+);
+app.post(
+  "/api/inventory/adjust",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const x = z
+      .object({
+        productId: id,
+        quantity: qty,
+        type: z.enum(["DESTROYED", "LOST", "RETURN", "CORRECTION"]),
+        correctionDirection: z
+          .enum(["INCREASE", "DECREASE"])
+          .nullable()
+          .optional(),
+        saleNumber: z.coerce.number().int().positive().optional(),
+        notes: z.string().optional(),
+      })
+      .parse(req.body);
+    if (x.type === "CORRECTION" && !x.correctionDirection)
+      throw error(
+        "VALIDATION",
+        "Correction direction is required for a correction",
+      );
+    if (["DESTROYED", "LOST"].includes(x.type) && !x.notes)
+      throw error("VALIDATION", "A note is required for this adjustment");
+    if (x.type === "RETURN" && !x.saleNumber)
+      throw error("VALIDATION", "Sale ID is required for a return");
+    const result = await tx(async (c) => {
+      if (x.type === "RETURN") {
+        const sale = await c.query(
+          "SELECT id FROM sales WHERE sale_number=$1",
+          [x.saleNumber],
+        );
+        if (!sale.rowCount) throw error("NOT_FOUND", "Sale ID not found", 404);
+        const candidates = await c.query(
+          "SELECT si.id,si.quantity-COALESCE((SELECT sum(sm.quantity) FROM stock_movements sm WHERE sm.reference_id=si.id AND sm.type='RETURN' AND sm.deleted_at IS NULL),0) available FROM sale_items si WHERE si.sale_id=$1 AND si.product_id=$2 ORDER BY si.id",
+          [sale.rows[0].id, x.productId],
+        );
+        if (!candidates.rowCount)
+          throw error(
+            "RETURN_NOT_SOLD",
+            "This product was not sold in that sale",
+          );
+        let remaining = x.quantity;
+        const returnItems: SaleReturnItem[] = [];
+        for (const candidate of candidates.rows) {
+          if (remaining <= 0) break;
+          const quantity = Math.min(remaining, +candidate.available);
+          if (quantity > 0) {
+            returnItems.push({ saleItemId: candidate.id, quantity });
+            remaining -= quantity;
+          }
+        }
+        if (remaining > 0)
+          throw error(
+            "RETURN_LIMIT",
+            "Returned quantity exceeds the quantity sold",
+          );
+        const reason = x.notes || "Customer return";
+        const processed = await processSaleReturn(
+          c,
+          req.user!,
+          sale.rows[0].id,
+          returnItems,
+          reason,
+        );
+        return {
+          ok: true,
+          ...processed,
+        };
+      }
+      const signed =
+        x.type === "CORRECTION"
+          ? x.correctionDirection === "DECREASE"
+            ? -x.quantity
+            : x.quantity
+          : -x.quantity;
+      await move(c, req.user!, x.productId, x.type, signed, x.notes);
+      await audit(c, req.user!, x.type, "PRODUCT", x.productId, {
+        ...x,
+        quantity: signed,
+      });
+      return { ok: true };
+    });
+    res.status(201).json(result);
+  }),
+);
+
+app.get(
+  "/api/reservations",
+  auth(),
+  asyncRoute(async (_q, res) => {
+    await expireReservations();
+    const r = await pool.query(
+      "SELECT r.*,p.name product_name,c.name customer_name,s.name supplier_name,u.name employee_name,CASE WHEN r.status='ACTIVE' AND r.expires_at IS NOT NULL AND r.expires_at<now() THEN 'EXPIRED' ELSE r.status::text END display_status,(r.selling_price-r.deposit_paid) remaining FROM reservations r JOIN products p ON p.id=r.product_id LEFT JOIN customers c ON c.id=r.customer_id LEFT JOIN suppliers s ON s.id=r.supplier_id JOIN users u ON u.id=r.created_by ORDER BY r.created_at DESC",
+    );
+    res.json(r.rows);
+  }),
+);
+app.post(
+  "/api/reservations",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const x = z
+      .object({
+        productId: id,
+        customerId: id.optional().nullable(),
+        supplierId: id.optional().nullable(),
+        quantity: qty,
+        sellingPrice: money,
+        depositPaid: money.default(0),
+        expiresAt: z.string().datetime().optional().nullable(),
+        notes: z.string().optional(),
+      })
+      .parse(req.body);
+    if (x.depositPaid > x.sellingPrice)
+      throw error("VALIDATION", "Deposit cannot exceed the negotiated price");
+    const out = await tx(async (c) => {
+      const r = await c.query(
+        "INSERT INTO reservations(product_id,customer_id,supplier_id,quantity,selling_price,deposit_paid,created_by,expires_at,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *",
+        [
+          x.productId,
+          x.customerId,
+          x.supplierId,
+          x.quantity,
+          x.sellingPrice,
+          x.depositPaid,
+          req.user!.id,
+          x.expiresAt,
+          x.notes,
+        ],
+      );
+      await move(
+        c,
+        req.user!,
+        x.productId,
+        "RESERVATION",
+        x.quantity,
+        x.notes,
+        undefined,
+        undefined,
+        r.rows[0].id,
+      );
+      await audit(c, req.user!, "RESERVE", "RESERVATION", r.rows[0].id, x);
+      return r.rows[0];
+    });
+    res.status(201).json(out);
+  }),
+);
+app.post(
+  "/api/reservations/:id/release",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const rid = id.parse(req.params.id);
+    await tx(async (c) => {
+      const r = await c.query(
+        "SELECT * FROM reservations WHERE id=$1 FOR UPDATE",
+        [rid],
+      );
+      if (!r.rowCount || r.rows[0].status !== "ACTIVE")
+        throw error("INVALID_RESERVATION", "Reservation is not active");
+      const x = r.rows[0];
+      await releaseReservedStock(
+        c,
+        req.user!,
+        x,
+        "RESERVATION_CANCEL",
+        req.body.notes,
+      );
+      await c.query(
+        "UPDATE reservations SET status='CANCELLED',updated_at=now() WHERE id=$1",
+        [rid],
+      );
+      await audit(c, req.user!, "RESERVATION_CANCEL", "RESERVATION", rid);
+    });
+    res.json({ ok: true });
+  }),
+);
+
+const saleSchema = z.object({
+  customerId: id.optional().nullable(),
+  items: z
+    .array(
+      z.object({
+        productId: id,
+        supplierId: id.optional().nullable(),
+        quantity: qty,
+        finalUnitPrice: money.optional(),
+        discountAmount: money.optional(),
+      }),
+    )
+    .min(1),
+  payments: z
+    .array(
+      z.object({
+        method: z.enum(["CASH", "CARD", "BANK_TRANSFER", "OTHER"]),
+        amount: money.positive(),
+      }),
+    )
+    .default([]),
+  notes: z.string().optional(),
+  businessDate: dateOnly.optional(),
+  deliveryRequired: z.boolean().default(false),
+  deliveryAddress: z.string().optional(),
+  deliveryDate: dateOnly.optional(),
+  deliveryNotes: z.string().optional(),
+});
+async function createSale(
+  c: PoolClient,
+  user: User,
+  x: z.infer<typeof saleSchema>,
+  reservationId?: string,
+) {
+  let subtotal = 0,
+    discount = 0;
+  const items: any[] = [];
+  for (const i of x.items) {
+    const p = await c.query("SELECT * FROM products WHERE id=$1 FOR UPDATE", [
+      i.productId,
+    ]);
+    if (!p.rowCount) throw error("NOT_FOUND", "Product not found", 404);
+    const product = p.rows[0];
+    if (
+      product.current_quantity - product.reserved_quantity < i.quantity &&
+      !reservationId
+    )
+      throw error(
+        "INSUFFICIENT_STOCK",
+        `Only ${product.current_quantity - product.reserved_quantity} units are available.`,
+      );
+    const regular = +product.selling_price,
+      final = i.finalUnitPrice ?? regular - (i.discountAmount || 0);
+    if (final < 0) throw error("VALIDATION", "Final price cannot be negative");
+    items.push({
+      ...i,
+      regular,
+      final,
+      cost: +product.purchase_price,
+      supplierId: i.supplierId ?? product.supplier_id,
+    });
+    subtotal += regular * i.quantity;
+    discount += (regular - final) * i.quantity;
+  }
+  const total = +(subtotal - discount).toFixed(2),
+    paid = +x.payments.reduce((s, p) => s + p.amount, 0).toFixed(2);
+  if (paid > total)
+    throw error("PAYMENT_EXCEEDS_TOTAL", "Payments cannot exceed sale total");
+  const sale = await c.query(
+    "INSERT INTO sales(customer_id,employee_id,subtotal,discount_total,total,notes,business_date,delivery_required,delivery_address,delivery_date,delivery_notes,delivery_status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *",
+    [
+      x.customerId,
+      user.id,
+      subtotal,
+      discount,
+      total,
+      x.notes || null,
+      x.businessDate || businessDate(),
+      x.deliveryRequired,
+      x.deliveryAddress || null,
+      x.deliveryDate || null,
+      x.deliveryNotes || null,
+      x.deliveryRequired ? "PENDING" : "NOT_REQUIRED",
+    ],
+  );
+  for (const i of items) {
+    await c.query(
+      "INSERT INTO sale_items(sale_id,product_id,supplier_id,quantity,regular_unit_price,discount_amount,final_unit_price,line_total,cost_price) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+      [
+        sale.rows[0].id,
+        i.productId,
+        i.supplierId || null,
+        i.quantity,
+        i.regular,
+        i.regular - i.final,
+        i.final,
+        i.final * i.quantity,
+        i.cost,
+      ],
+    );
+    if (reservationId)
+      await releaseReservedStock(
+        c,
+        user,
+        { product_id: i.productId, quantity: i.quantity, id: reservationId },
+        "RESERVATION_RELEASE",
+        "Converted to sale",
+      );
+    await move(
+      c,
+      user,
+      i.productId,
+      "SALE",
+      -i.quantity,
+      "Sale",
+      undefined,
+      undefined,
+      sale.rows[0].id,
+    );
+  }
+  for (const payment of x.payments)
+    await c.query(
+      "INSERT INTO sale_payments(sale_id,method,amount) VALUES($1,$2,$3)",
+      [sale.rows[0].id, payment.method, payment.amount],
+    );
+  return sale.rows[0];
+}
+app.get(
+  "/api/sales",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const q = String(req.query.q || ""),
+      r = await pool.query(
+        `SELECT
+           s.*,
+           c.name AS customer_name,
+           u.name AS employee_name,
+           COALESCE(pay.gross_paid, 0) AS gross_paid,
+           COALESCE(ref.refunded, 0) AS refunded,
+           COALESCE(ret.returned_value, 0) AS returned_value,
+           COALESCE(items.value, '[]') AS items
+         FROM sales s
+         LEFT JOIN customers c ON c.id = s.customer_id
+         JOIN users u ON u.id = s.employee_id
+         LEFT JOIN LATERAL (
+           SELECT sum(amount) AS gross_paid
+           FROM sale_payments
+           WHERE sale_id = s.id
+         ) pay ON true
+         LEFT JOIN LATERAL (
+           SELECT sum(amount) AS refunded
+           FROM sale_refunds
+           WHERE sale_id = s.id
+         ) ref ON true
+         LEFT JOIN LATERAL (
+           SELECT sum(sm.quantity * si.final_unit_price) AS returned_value
+           FROM sale_items si
+           JOIN stock_movements sm
+             ON sm.reference_id = si.id
+            AND sm.type = 'RETURN'
+            AND sm.deleted_at IS NULL
+           WHERE si.sale_id = s.id
+         ) ret ON true
+         LEFT JOIN LATERAL (
+           SELECT json_agg(
+             json_build_object(
+               'name', p.name,
+               'quantity', si.quantity,
+               'costPrice', si.cost_price,
+               'salePrice', si.final_unit_price
+             )
+             ORDER BY si.id
+           ) AS value
+           FROM sale_items si
+           JOIN products p ON p.id = si.product_id
+           WHERE si.sale_id = s.id
+         ) items ON true
+         ${q ? "WHERE s.sale_number::text ILIKE $1 OR c.name ILIKE $1" : ""}
+         ORDER BY s.business_date DESC, s.created_at DESC`,
+        q ? [`%${q}%`] : [],
+      );
+    res.json(
+      r.rows.map((sale) => {
+        const balance = calculateSaleBalance(
+          +sale.total,
+          +sale.gross_paid,
+          +sale.refunded,
+          +sale.returned_value,
+        );
+        return { ...sale, ...balance };
+      }),
+    );
+  }),
+);
+app.post(
+  "/api/sales",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const x = saleSchema.parse(req.body);
+    if (!x.businessDate) throw error("VALIDATION", "Sale date is required");
+    const out = await tx(async (c) => {
+      const sale = await createSale(c, req.user!, x);
+      await audit(c, req.user!, "SALE", "SALE", sale.id, {
+        total: sale.total,
+        businessDate: x.businessDate,
+      });
+      return sale;
+    });
+    res.status(201).json(out);
+  }),
+);
+app.get(
+  "/api/sales/:id",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const sid = id.parse(req.params.id);
+    const sale = await pool.query(
+      "SELECT s.*,c.name customer_name,u.name employee_name FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.employee_id WHERE s.id=$1",
+      [sid],
+    );
+    if (!sale.rowCount) throw error("NOT_FOUND", "Sale not found", 404);
+    const [items, payments] = await Promise.all([
+      pool.query(
+        "SELECT si.*,p.name product_name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE sale_id=$1",
+        [sid],
+      ),
+      pool.query("SELECT * FROM sale_payments WHERE sale_id=$1", [sid]),
+    ]);
+    res.json({ ...sale.rows[0], items: items.rows, payments: payments.rows });
+  }),
+);
+app.put(
+  "/api/sales/:id/paid",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const saleId = id.parse(req.params.id);
+    const x = z
+      .object({
+        paid: money,
+        method: z
+          .enum(["CASH", "CARD", "BANK_TRANSFER", "OTHER"])
+          .default("CASH"),
+      })
+      .parse(req.body);
+    const result = await tx(async (c) => {
+      const sale = await c.query(
+        `SELECT
+           s.total,
+           s.status,
+           COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id), 0) AS gross_paid,
+           COALESCE((SELECT sum(amount) FROM sale_refunds WHERE sale_id=s.id), 0) AS refunded,
+           COALESCE((
+             SELECT sum(sm.quantity * si.final_unit_price)
+             FROM sale_items si
+             JOIN stock_movements sm
+               ON sm.reference_id=si.id
+              AND sm.type='RETURN'
+              AND sm.deleted_at IS NULL
+             WHERE si.sale_id=s.id
+           ), 0) AS returned_value
+         FROM sales s
+         WHERE s.id=$1
+         FOR UPDATE`,
+        [saleId],
+      );
+      if (!sale.rowCount) throw error("NOT_FOUND", "Sale not found", 404);
+      const row = sale.rows[0];
+      if (row.status === "CANCELLED")
+        throw error("INVALID_PAYMENT", "Cancelled sales cannot accept payments");
+      const currentBalance = calculateSaleBalance(
+        +row.total,
+        +row.gross_paid,
+        +row.refunded,
+        +row.returned_value,
+      );
+      if (x.paid > currentBalance.effectiveTotal)
+        throw error(
+          "PAYMENT_EXCEEDS_TOTAL",
+          "Paid amount cannot exceed the value of the products kept by the customer",
+        );
+      if (x.paid < currentBalance.paid)
+        throw error(
+          "PAYMENT_REDUCTION_NOT_ALLOWED",
+          "Paid amount cannot be reduced because payment history is preserved",
+        );
+      const difference = +(x.paid - currentBalance.paid).toFixed(2);
+      if (difference > 0)
+        await c.query(
+          "INSERT INTO sale_payments(sale_id,method,amount) VALUES($1,$2,$3)",
+          [saleId, x.method, difference],
+        );
+      await audit(c, req.user!, "ADD_PAYMENT", "SALE", saleId, {
+        amount: difference,
+        paid: x.paid,
+        method: x.method,
+      });
+      return {
+        ...calculateSaleBalance(
+          +row.total,
+          +row.gross_paid + difference,
+          +row.refunded,
+          +row.returned_value,
+        ),
+      };
+    });
+    res.json(result);
+  }),
+);
+app.put(
+  "/api/sales/:id/delivery",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const saleId = id.parse(req.params.id);
+    const result = await tx(async (c) => {
+      const sale = await c.query(
+        `SELECT
+           s.id,
+           s.total,
+           s.status,
+           s.delivery_status,
+           COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id), 0) AS gross_paid,
+           COALESCE((SELECT sum(amount) FROM sale_refunds WHERE sale_id=s.id), 0) AS refunded,
+           COALESCE((
+             SELECT sum(sm.quantity * si.final_unit_price)
+             FROM sale_items si
+             JOIN stock_movements sm
+               ON sm.reference_id=si.id
+              AND sm.type='RETURN'
+              AND sm.deleted_at IS NULL
+             WHERE si.sale_id=s.id
+           ), 0) AS returned_value
+         FROM sales s
+         WHERE s.id=$1
+         FOR UPDATE`,
+        [saleId],
+      );
+      if (!sale.rowCount) throw error("NOT_FOUND", "Sale not found", 404);
+      const row = sale.rows[0];
+      if (!["COMPLETED", "PARTIALLY_RETURNED"].includes(row.status))
+        throw error(
+          "INVALID_DELIVERY",
+          "Only active completed sales can be sent for delivery",
+        );
+      const balance = calculateSaleBalance(
+        +row.total,
+        +row.gross_paid,
+        +row.refunded,
+        +row.returned_value,
+      );
+      if (balance.paid < balance.effectiveTotal)
+        throw error(
+          "PAYMENT_REQUIRED",
+          "The final sale amount must be fully paid before delivery",
+        );
+      const current = row.delivery_status;
+      const next = nextDeliveryStatus(current);
+      if (current === next) return { deliveryStatus: next };
+      await c.query(
+        "UPDATE sales SET delivery_required=true,delivery_status=$1,updated_at=now() WHERE id=$2",
+        [next, saleId],
+      );
+      await audit(c, req.user!, next, "SALE", saleId);
+      return { deliveryStatus: next };
+    });
+    res.json(result);
+  }),
+);
+app.post(
+  "/api/sales/:id/returns",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const sid = id.parse(req.params.id);
+    const x = z
+      .object({
+        items: z.array(z.object({ saleItemId: id, quantity: qty })).min(1),
+        reason: z.string().min(1),
+      })
+      .parse(req.body);
+    const result = await tx((c) =>
+      processSaleReturn(c, req.user!, sid, x.items as SaleReturnItem[], x.reason),
+    );
+    res.json({ ok: true, ...result });
+  }),
+);
+app.post(
+  "/api/reservations/:id/complete",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const rid = id.parse(req.params.id);
+    const out = await tx(async (c) => {
+      const r = await c.query(
+        "SELECT * FROM reservations WHERE id=$1 FOR UPDATE",
+        [rid],
+      );
+      if (!r.rowCount || r.rows[0].status !== "ACTIVE")
+        throw error("INVALID_RESERVATION", "Reservation is not active");
+      const reservation = r.rows[0];
+      if (reservation.selling_price === null)
+        throw error(
+          "VALIDATION",
+          "This reservation has no selling price and cannot be marked sold",
+        );
+      const x = {
+        customerId: reservation.customer_id,
+        items: [
+          {
+            productId: reservation.product_id,
+            supplierId: reservation.supplier_id,
+            quantity: reservation.quantity,
+            finalUnitPrice: +reservation.selling_price,
+          },
+        ],
+        payments:
+          +reservation.deposit_paid > 0
+            ? [{ method: "CASH" as const, amount: +reservation.deposit_paid }]
+            : [],
+        notes: reservation.notes || undefined,
+        deliveryRequired: false,
+      };
+      const sale = await createSale(c, req.user!, x, rid);
+      await c.query(
+        "UPDATE reservations SET status='COMPLETED',updated_at=now() WHERE id=$1",
+        [rid],
+      );
+      await audit(c, req.user!, "COMPLETE_RESERVATION", "RESERVATION", rid, {
+        saleId: sale.id,
+        depositPaid: reservation.deposit_paid,
+      });
+      return sale;
+    });
+    res.status(201).json(out);
+  }),
+);
+
+app.get(
+  "/api/stock-movements",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const p: string[] = [];
+    const where: string[] = [];
+    for (const [field, col] of [
+      ["productId", "sm.product_id"],
+      ["userId", "sm.user_id"],
+      ["type", "sm.type"],
+    ] as const) {
+      if (req.query[field]) {
+        p.push(String(req.query[field]));
+        where.push(`${col}=$${p.length}`);
+      }
+    }
+    if (req.query.from) {
+      p.push(String(req.query.from));
+      where.push(
+        `COALESCE(sm.business_date,sm.created_at::date) >= $${p.length}::date`,
+      );
+    }
+    if (req.query.to) {
+      p.push(String(req.query.to));
+      where.push(
+        `COALESCE(sm.business_date,sm.created_at::date) <= $${p.length}::date`,
+      );
+    }
+    const r = await pool.query(
+      `SELECT sm.*,(SELECT si.final_unit_price FROM sale_items si WHERE si.sale_id=sm.reference_id AND si.product_id=sm.product_id LIMIT 1) sale_selling_price,COALESCE(sm.business_date,sm.created_at::date) display_date,p.name product_name,u.name employee_name,s.name supplier_name,cu.name customer_name,du.name deleted_by_name FROM stock_movements sm JOIN products p ON p.id=sm.product_id JOIN users u ON u.id=sm.user_id LEFT JOIN suppliers s ON s.id=sm.supplier_id LEFT JOIN sales sa ON sa.id=sm.reference_id LEFT JOIN customers cu ON cu.id=sa.customer_id LEFT JOIN users du ON du.id=sm.deleted_by ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY COALESCE(sm.business_date,sm.created_at::date) DESC,sm.created_at DESC LIMIT 500`,
+      p,
+    );
+    const events = await pool.query(
+      "SELECT e.id,e.product_id,e.product_name,e.action type,NULL::integer quantity,NULL::numeric purchase_price,NULL::numeric sale_selling_price,e.created_at,e.created_at::date display_date,u.name employee_name,NULL::text supplier_name,NULL::text customer_name,NULL::uuid reference_id,e.notes,NULL::timestamptz deleted_at FROM product_events e JOIN users u ON u.id=e.user_id",
+    );
+    res.json(
+      [...r.rows, ...events.rows].sort(
+        (a, b) =>
+          new Date(b.display_date || b.created_at).getTime() -
+          new Date(a.display_date || a.created_at).getTime(),
+      ),
+    );
+  }),
+);
+app.delete(
+  "/api/stock-movements/:id",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const movementId = id.parse(req.params.id);
+    const reason = z
+      .object({ reason: z.string().min(3) })
+      .parse(req.body).reason;
+    const result = await tx(async (c) => {
+      const movement = await c.query(
+        "SELECT * FROM stock_movements WHERE id=$1 FOR UPDATE",
+        [movementId],
+      );
+      if (!movement.rowCount)
+        throw error("NOT_FOUND", "Inventory operation not found", 404);
+      const m = movement.rows[0];
+      if (m.deleted_at)
+        throw error(
+          "ALREADY_DELETED",
+          "This inventory operation has already been reversed",
+        );
+      if (
+        !["IMPORT", "LOST", "DESTROYED", "CORRECTION"].includes(m.type)
+      )
+        throw error(
+          "CANNOT_REVERSE",
+          m.type === "RETURN"
+            ? "Returns cannot be reversed because their sale and refund records must remain consistent"
+            : "Sales and reservations must be handled through their dedicated workflows",
+        );
+      const product = await c.query(
+        "SELECT * FROM products WHERE id=$1 FOR UPDATE",
+        [m.product_id],
+      );
+      const p = product.rows[0],
+        newCurrent = p.current_quantity - m.quantity;
+      if (newCurrent < 0 || newCurrent < p.reserved_quantity)
+        throw error(
+          "CANNOT_REVERSE",
+          "This operation cannot be reversed because it would invalidate current stock or reservations",
+        );
+      await c.query(
+        "UPDATE products SET current_quantity=$1,updated_at=now() WHERE id=$2",
+        [newCurrent, p.id],
+      );
+      await c.query(
+        "UPDATE stock_movements SET deleted_at=now(),deleted_by=$1,deletion_reason=$2,notes=CASE WHEN notes IS NULL OR notes='' THEN $2 ELSE notes || ' | Reversal reason: ' || $2 END WHERE id=$3",
+        [req.user!.id, reason, movementId],
+      );
+      await c.query(
+        "INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,supplier_id,purchase_price,notes) VALUES($1,'REVERSED',$2,$3,$4,$5,$6,$7)",
+        [
+          m.product_id,
+          -m.quantity,
+          req.user!.id,
+          m.id,
+          m.supplier_id,
+          m.purchase_price,
+          reason,
+        ],
+      );
+      await audit(
+        c,
+        req.user!,
+        "REVERSE_MOVEMENT",
+        "STOCK_MOVEMENT",
+        movementId,
+        { reason, originalQuantity: m.quantity },
+      );
+      return { ok: true };
+    });
+    res.json(result);
+  }),
+);
+app.get(
+  "/api/customers/:id/history",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const cid = id.parse(req.params.id);
+    const c = await pool.query("SELECT * FROM customers WHERE id=$1", [cid]);
+    if (!c.rowCount) throw error("NOT_FOUND", "Customer not found", 404);
+    const sales = await pool.query(
+      `SELECT
+         s.*,
+         COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id), 0) AS gross_paid,
+         COALESCE((SELECT sum(amount) FROM sale_refunds WHERE sale_id=s.id), 0) AS refunded,
+         COALESCE((
+           SELECT sum(sm.quantity * si.final_unit_price)
+           FROM sale_items si
+           JOIN stock_movements sm
+             ON sm.reference_id=si.id
+            AND sm.type='RETURN'
+            AND sm.deleted_at IS NULL
+           WHERE si.sale_id=s.id
+         ), 0) AS returned_value
+       FROM sales s
+       WHERE customer_id=$1
+       ORDER BY business_date DESC, created_at DESC`,
+      [cid],
+    );
+    const history = sales.rows.map((sale) => ({
+      ...sale,
+      ...calculateSaleBalance(
+        +sale.total,
+        +sale.gross_paid,
+        +sale.refunded,
+        +sale.returned_value,
+      ),
+    }));
+    res.json({
+      customer: c.rows[0],
+      sales: history,
+      totalSpent: history.reduce((sum, sale) => sum + sale.paid, 0),
+    });
+  }),
+);
+
+app.get(
+  "/api/dashboard",
+  auth(),
+  asyncRoute(async (_q, res) => {
+    await expireReservations();
+    const r = await pool.query(
+      `SELECT
+         (SELECT count(*) FROM products WHERE is_active) AS products,
+         (SELECT COALESCE(sum(current_quantity-reserved_quantity), 0) FROM products WHERE is_active) AS available,
+         (SELECT COALESCE(sum(reserved_quantity), 0) FROM products) AS reserved,
+         (SELECT count(*) FROM products WHERE current_quantity=0 AND is_active) AS out_stock,
+         (SELECT count(*) FROM customers) AS customers,
+         (
+           SELECT COALESCE(sum(GREATEST(COALESCE(pay.paid, 0)-COALESCE(ref.refunded, 0), 0)), 0)
+           FROM sales s
+           LEFT JOIN LATERAL (SELECT sum(amount) paid FROM sale_payments WHERE sale_id=s.id) pay ON true
+           LEFT JOIN LATERAL (SELECT sum(amount) refunded FROM sale_refunds WHERE sale_id=s.id) ref ON true
+           WHERE s.business_date=current_date
+         ) AS today_revenue,
+         (
+           SELECT COALESCE(sum(GREATEST(COALESCE(pay.paid, 0)-COALESCE(ref.refunded, 0), 0)), 0)
+           FROM sales s
+           LEFT JOIN LATERAL (SELECT sum(amount) paid FROM sale_payments WHERE sale_id=s.id) pay ON true
+           LEFT JOIN LATERAL (SELECT sum(amount) refunded FROM sale_refunds WHERE sale_id=s.id) ref ON true
+           WHERE date_trunc('month', s.business_date)=date_trunc('month', current_date)
+         ) AS month_revenue`,
+    );
+    const top = await pool.query(
+      `SELECT
+         p.name,
+         sum(si.quantity-COALESCE(ret.quantity, 0)) AS quantity
+       FROM sale_items si
+       JOIN products p ON p.id=si.product_id
+       JOIN sales s ON s.id=si.sale_id
+       LEFT JOIN LATERAL (
+         SELECT sum(quantity) AS quantity
+         FROM stock_movements
+         WHERE reference_id=si.id AND type='RETURN' AND deleted_at IS NULL
+       ) ret ON true
+       WHERE s.status IN ('COMPLETED', 'PARTIALLY_RETURNED')
+       GROUP BY p.id, p.name
+       HAVING sum(si.quantity-COALESCE(ret.quantity, 0)) > 0
+       ORDER BY quantity DESC
+       LIMIT 5`,
+    );
+    const trend = await pool.query(
+      `SELECT
+         to_char(s.business_date, 'YYYY-MM-DD') AS date,
+         sum(GREATEST(COALESCE(pay.paid, 0)-COALESCE(ref.refunded, 0), 0)) AS revenue
+       FROM sales s
+       LEFT JOIN LATERAL (SELECT sum(amount) paid FROM sale_payments WHERE sale_id=s.id) pay ON true
+       LEFT JOIN LATERAL (SELECT sum(amount) refunded FROM sale_refunds WHERE sale_id=s.id) ref ON true
+       WHERE s.business_date >= current_date-interval '30 days'
+       GROUP BY s.business_date
+       ORDER BY s.business_date`,
+    );
+    res.json({ ...r.rows[0], topProducts: top.rows, salesTrend: trend.rows });
+  }),
+);
+app.get(
+  "/api/inventory/summary",
+  auth(),
+  asyncRoute(async (_q, res) => {
+    const r = await pool.query(
+      "SELECT COALESCE(sum(current_quantity),0) physical_stock,COALESCE(sum(reserved_quantity),0) reserved,COALESCE(sum(current_quantity-reserved_quantity),0) available,COALESCE(sum(current_quantity*purchase_price),0) cost_value FROM products WHERE is_active",
+    );
+    res.json(r.rows[0]);
+  }),
+);
+app.get(
+  "/api/inventory/movements",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const values: any[] = [],
+      where: string[] = [];
+    const add = (sql: string, value: any) => {
+      values.push(value);
+      where.push(sql.replace("?", `$${values.length}`));
+    };
+    if (req.query.productId)
+      add("sm.product_id=?", String(req.query.productId));
+    if (req.query.supplierId)
+      add("sm.supplier_id=?", String(req.query.supplierId));
+    if (req.query.type) add("sm.type=?", String(req.query.type));
+    if (req.query.status === "ACTIVE") where.push("sm.deleted_at IS NULL");
+    if (req.query.status === "REVERSED")
+      where.push("(sm.deleted_at IS NOT NULL OR sm.type='REVERSED')");
+    if (req.query.from)
+      add(
+        "COALESCE(sm.business_date,sm.created_at::date)>=?::date",
+        String(req.query.from),
+      );
+    if (req.query.to)
+      add(
+        "COALESCE(sm.business_date,sm.created_at::date)<=?::date",
+        String(req.query.to),
+      );
+    const r = await pool.query(
+      `SELECT sm.*,COALESCE(sm.business_date,sm.created_at::date) display_date,p.name product_name,u.name employee_name,s.name supplier_name FROM stock_movements sm JOIN products p ON p.id=sm.product_id JOIN users u ON u.id=sm.user_id LEFT JOIN suppliers s ON s.id=sm.supplier_id ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY COALESCE(sm.business_date,sm.created_at::date) DESC,sm.created_at DESC LIMIT 500`,
+      values,
+    );
+    res.json(r.rows);
+  }),
+);
+app.get(
+  "/api/deliveries",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const filter = String(req.query.status || "ALL");
+    const r = await pool.query(
+      `SELECT
+         s.*,
+         c.name AS customer_name,
+         c.phone AS customer_phone,
+         COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id), 0) AS gross_paid,
+         COALESCE((SELECT sum(amount) FROM sale_refunds WHERE sale_id=s.id), 0) AS refunded,
+         COALESCE((
+           SELECT sum(sm.quantity * si.final_unit_price)
+           FROM sale_items si
+           JOIN stock_movements sm
+             ON sm.reference_id=si.id
+            AND sm.type='RETURN'
+            AND sm.deleted_at IS NULL
+           WHERE si.sale_id=s.id
+         ), 0) AS returned_value,
+         COALESCE((
+           SELECT json_agg(
+             json_build_object('name', p.name, 'quantity', si.quantity)
+             ORDER BY si.id
+           )
+           FROM sale_items si
+           JOIN products p ON p.id=si.product_id
+           WHERE si.sale_id=s.id
+         ), '[]') AS items
+       FROM sales s
+       LEFT JOIN customers c ON c.id=s.customer_id
+       WHERE s.delivery_status IN ('IN_TRANSIT', 'DELIVERED')
+          OR s.status IN ('COMPLETED', 'PARTIALLY_RETURNED')
+       ORDER BY s.business_date DESC, s.created_at DESC`,
+    );
+    const rows = r.rows
+      .map((sale) => {
+        const balance = calculateSaleBalance(
+          +sale.total,
+          +sale.gross_paid,
+          +sale.refunded,
+          +sale.returned_value,
+        );
+        return {
+          ...sale,
+          ...balance,
+          delivery_view_status: ["IN_TRANSIT", "DELIVERED"].includes(
+            sale.delivery_status,
+          )
+            ? sale.delivery_status
+            : "READY",
+        };
+      })
+      .filter(
+        (sale) =>
+          ["IN_TRANSIT", "DELIVERED"].includes(sale.delivery_status) ||
+          (sale.status !== "RETURNED" &&
+            sale.paid >= sale.effectiveTotal &&
+            sale.effectiveTotal > 0),
+      )
+      .filter((s) => filter === "ALL" || s.delivery_view_status === filter);
+    res.json(rows);
+  }),
+);
+app.put(
+  "/api/deliveries/:id/delivered",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const saleId = id.parse(req.params.id);
+    const result = await tx(async (c) => {
+      const r = await c.query(
+        "UPDATE sales SET delivery_status='DELIVERED',delivery_required=true,updated_at=now() WHERE id=$1 AND delivery_status='IN_TRANSIT' RETURNING id,delivery_status",
+        [saleId],
+      );
+      if (!r.rowCount)
+        throw error(
+          "INVALID_DELIVERY",
+          "Only in-transit deliveries can be marked delivered",
+        );
+      await audit(c, req.user!, "DELIVERED", "SALE", saleId);
+      return r.rows[0];
+    });
+    res.json(result);
+  }),
+);
+app.get(
+  "/api/payments",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const filter = String(req.query.status || "OUTSTANDING");
+    const r = await pool.query(
+      `SELECT
+         s.id,
+         s.sale_number,
+         s.business_date,
+         s.total,
+         c.name AS customer_name,
+         c.phone AS customer_phone,
+         COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id), 0) AS gross_paid,
+         COALESCE((SELECT sum(amount) FROM sale_refunds WHERE sale_id=s.id), 0) AS refunded,
+         COALESCE((
+           SELECT sum(sm.quantity * si.final_unit_price)
+           FROM sale_items si
+           JOIN stock_movements sm
+             ON sm.reference_id=si.id
+            AND sm.type='RETURN'
+            AND sm.deleted_at IS NULL
+           WHERE si.sale_id=s.id
+         ), 0) AS returned_value
+       FROM sales s
+       LEFT JOIN customers c ON c.id=s.customer_id
+       WHERE s.status IN ('COMPLETED', 'PARTIALLY_RETURNED')
+       ORDER BY s.business_date DESC, s.created_at DESC`,
+    );
+    const rows = r.rows
+      .map((sale) => {
+        const balance = calculateSaleBalance(
+          +sale.total,
+          +sale.gross_paid,
+          +sale.refunded,
+          +sale.returned_value,
+        );
+        return {
+          ...sale,
+          ...balance,
+          payment_status: balance.paymentStatus,
+        };
+      })
+      .filter((s) =>
+        filter === "ALL"
+          ? true
+          : filter === "OUTSTANDING"
+            ? s.remaining > 0
+            : filter === "PAID"
+              ? s.remaining <= 0
+              : true,
+      );
+    res.json(rows);
+  }),
+);
+app.get(
+  "/api/reports",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const period = z
+      .enum(["MONTH", "QUARTER", "YEAR"])
+      .catch("MONTH")
+      .parse(String(req.query.period || "MONTH"));
+    const { from, to } = reportPeriodBounds(period);
+    const [
+      sales,
+      imports,
+      losses,
+      returns,
+      refunds,
+      mostReturned,
+      supplierEarnings,
+      mostSold,
+      inTransit,
+    ] = await Promise.all([
+      pool.query(
+        `SELECT
+           COALESCE(sum(GREATEST(COALESCE(pay.paid, 0) - COALESCE(ref.refund, 0), 0)), 0) AS revenue,
+           count(*) FILTER (
+             WHERE s.status IN ('COMPLETED', 'PARTIALLY_RETURNED')
+               AND GREATEST(s.total - COALESCE(ret.returned_value, 0), 0) > 0
+               AND GREATEST(COALESCE(pay.paid, 0) - COALESCE(ref.refund, 0), 0)
+                   >= GREATEST(s.total - COALESCE(ret.returned_value, 0), 0)
+           ) AS paid_closed_sales
+         FROM sales s
+         LEFT JOIN LATERAL (
+           SELECT sum(amount) AS paid FROM sale_payments WHERE sale_id=s.id
+         ) pay ON true
+         LEFT JOIN LATERAL (
+           SELECT sum(amount) AS refund FROM sale_refunds WHERE sale_id=s.id
+         ) ref ON true
+         LEFT JOIN LATERAL (
+           SELECT sum(sm.quantity * si.final_unit_price) AS returned_value
+           FROM sale_items si
+           JOIN stock_movements sm
+             ON sm.reference_id=si.id
+            AND sm.type='RETURN'
+            AND sm.deleted_at IS NULL
+           WHERE si.sale_id=s.id
+         ) ret ON true
+         WHERE s.business_date >= $1::date
+           AND s.business_date < $2::date`,
+        [from, to],
+      ),
+      pool.query(
+        "SELECT COALESCE(sum(sm.quantity*sm.purchase_price),0) cost FROM stock_movements sm WHERE sm.type='IMPORT' AND sm.deleted_at IS NULL AND COALESCE(sm.business_date,sm.created_at::date)>=$1::date AND COALESCE(sm.business_date,sm.created_at::date)<$2::date",
+        [from, to],
+      ),
+      pool.query(
+        "SELECT COALESCE(sum(abs(sm.quantity)*COALESCE(sm.purchase_price,0)),0) amount FROM stock_movements sm WHERE sm.type IN ('LOST','DESTROYED') AND sm.deleted_at IS NULL AND COALESCE(sm.business_date,sm.created_at::date)>=$1::date AND COALESCE(sm.business_date,sm.created_at::date)<$2::date",
+        [from, to],
+      ),
+      pool.query(
+        "SELECT COALESCE(sum(sm.quantity),0) quantity FROM stock_movements sm WHERE sm.type='RETURN' AND sm.deleted_at IS NULL AND COALESCE(sm.business_date,sm.created_at::date)>=$1::date AND COALESCE(sm.business_date,sm.created_at::date)<$2::date",
+        [from, to],
+      ),
+      pool.query(
+        "SELECT COALESCE(sum(amount),0) amount FROM sale_refunds WHERE created_at>=$1::date AND created_at<$2::date",
+        [from, to],
+      ),
+      pool.query(
+        "SELECT p.name,COALESCE(sum(sm.quantity),0) quantity FROM stock_movements sm JOIN products p ON p.id=sm.product_id WHERE sm.type='RETURN' AND sm.deleted_at IS NULL AND COALESCE(sm.business_date,sm.created_at::date)>=$1::date AND COALESCE(sm.business_date,sm.created_at::date)<$2::date GROUP BY p.id,p.name ORDER BY quantity DESC,p.name LIMIT 1",
+        [from, to],
+      ),
+      pool.query(
+        `SELECT
+           COALESCE(sup.name, 'Unassigned') AS supplier_name,
+           COALESCE(sum((si.quantity-COALESCE(ret.quantity, 0))*si.final_unit_price), 0) AS revenue,
+           COALESCE(sum(si.quantity-COALESCE(ret.quantity, 0)), 0) AS quantity
+         FROM sales s
+         JOIN sale_items si ON si.sale_id=s.id
+         LEFT JOIN suppliers sup ON sup.id=si.supplier_id
+         LEFT JOIN LATERAL (
+           SELECT sum(sm.quantity) AS quantity
+           FROM stock_movements sm
+           WHERE sm.reference_id=si.id
+             AND sm.type='RETURN'
+             AND sm.deleted_at IS NULL
+         ) ret ON true
+         WHERE s.business_date >= $1::date
+           AND s.business_date < $2::date
+           AND s.status IN ('COMPLETED', 'PARTIALLY_RETURNED')
+         GROUP BY sup.id, sup.name
+         ORDER BY revenue DESC, supplier_name`,
+        [from, to],
+      ),
+      pool.query(
+        "SELECT p.name,COALESCE(sum(si.quantity-COALESCE(ret.quantity,0)),0) quantity FROM sales s JOIN sale_items si ON si.sale_id=s.id JOIN products p ON p.id=si.product_id LEFT JOIN LATERAL(SELECT sum(sm.quantity) quantity FROM stock_movements sm WHERE sm.type='RETURN' AND sm.deleted_at IS NULL AND sm.reference_id=si.id) ret ON true WHERE s.business_date>=$1::date AND s.business_date<$2::date GROUP BY p.id,p.name ORDER BY quantity DESC,p.name LIMIT 1",
+        [from, to],
+      ),
+      pool.query(
+        "SELECT count(*) count FROM sales WHERE delivery_status='IN_TRANSIT'",
+      ),
+    ]);
+    res.json({
+      period,
+      from,
+      to,
+      metrics: {
+        revenue: +sales.rows[0].revenue,
+        importCost: +imports.rows[0].cost,
+        lossAmount: +losses.rows[0].amount,
+        returnedQuantity: +returns.rows[0].quantity,
+        refundedAmount: +refunds.rows[0].amount,
+        paidClosedSales: +sales.rows[0].paid_closed_sales,
+        inTransit: +inTransit.rows[0].count,
+      },
+      mostReturnedProduct: mostReturned.rows[0] || null,
+      mostSoldProduct: mostSold.rows[0] || null,
+      supplierEarnings: supplierEarnings.rows,
+    });
+  }),
+);
+
+app.get(
+  "/api/users",
+  auth(["ADMIN"]),
+  asyncRoute(async (_q, res) => {
+    const r = await pool.query(
+      "SELECT id,name,username,role,is_active,last_login,created_at FROM users ORDER BY created_at",
+    );
+    res.json(r.rows);
+  }),
+);
+app.post(
+  "/api/users",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const x = z
+      .object({
+        name: z.string().min(1),
+        username: z.string().min(3),
+        password: z.string().min(8),
+        role: z.enum(["ADMIN", "EMPLOYEE"]).default("EMPLOYEE"),
+      })
+      .parse(req.body);
+    const r = await pool.query(
+      "INSERT INTO users(name,username,password_hash,role) VALUES($1,$2,$3,$4) RETURNING id,name,username,role,is_active,created_at",
+      [x.name, x.username, await bcrypt.hash(x.password, 12), x.role],
+    );
+    res.status(201).json(r.rows[0]);
+  }),
+);
+app.put(
+  "/api/users/:id/password",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const userId = id.parse(req.params.id),
+      x = z
+        .object({
+          newPassword: z.string().min(8),
+          confirmPassword: z.string().min(8),
+        })
+        .parse(req.body);
+    if (x.newPassword !== x.confirmPassword)
+      throw error(
+        "PASSWORD_MISMATCH",
+        "New password and confirmation must match",
+      );
+    await tx(async (c) => {
+      const employee = await c.query(
+        "SELECT id,role FROM users WHERE id=$1 FOR UPDATE",
+        [userId],
+      );
+      if (!employee.rowCount)
+        throw error("NOT_FOUND", "Employee not found", 404);
+      if (employee.rows[0].role !== "EMPLOYEE")
+        throw error(
+          "PASSWORD_RESET_RESTRICTED",
+          "Only employee passwords can be reset",
+        );
+      await c.query("UPDATE users SET password_hash=$1 WHERE id=$2", [
+        await bcrypt.hash(x.newPassword, 12),
+        userId,
+      ]);
+      await audit(c, req.user!, "RESET_EMPLOYEE_PASSWORD", "USER", userId);
+    });
+    res.json({ ok: true });
+  }),
+);
+app.patch(
+  "/api/users/:id",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const x = z
+      .object({
+        name: z.string().min(1).optional(),
+        role: z.enum(["ADMIN", "EMPLOYEE"]).optional(),
+        isActive: z.boolean().optional(),
+      })
+      .parse(req.body);
+    if (!Object.keys(x).length)
+      throw error("VALIDATION", "No employee changes supplied");
+    const userId = id.parse(req.params.id);
+    const result = await tx(async (c) => {
+      await c.query("SELECT pg_advisory_xact_lock(927364)");
+      const target = await c.query(
+        "SELECT id,role,is_active FROM users WHERE id=$1 FOR UPDATE",
+        [userId],
+      );
+      if (!target.rowCount)
+        throw error("NOT_FOUND", "Employee not found", 404);
+
+      const willRemainAdmin =
+        (x.role ?? target.rows[0].role) === "ADMIN" &&
+        (x.isActive ?? target.rows[0].is_active);
+      if (target.rows[0].role === "ADMIN" && !willRemainAdmin) {
+        const activeAdmins = await c.query(
+          "SELECT id FROM users WHERE role='ADMIN' AND is_active FOR UPDATE",
+        );
+        if (activeAdmins.rowCount <= 1)
+          throw error(
+            "LAST_ADMIN",
+            "The last active administrator cannot be disabled or changed to employee",
+          );
+      }
+
+      const updated = await c.query(
+        "UPDATE users SET name=COALESCE($1,name),role=COALESCE($2,role),is_active=COALESCE($3,is_active) WHERE id=$4 RETURNING id,name,username,role,is_active,last_login,created_at",
+        [x.name, x.role, x.isActive, userId],
+      );
+      await audit(c, req.user!, "UPDATE_USER", "USER", userId, x);
+      return updated.rows[0];
+    });
+    res.json(result);
+  }),
+);
+app.get(
+  "/api/audit-logs",
+  auth(["ADMIN"]),
+  asyncRoute(async (_q, res) => {
+    const r = await pool.query(
+      "SELECT a.*,u.name user_name FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.created_at DESC LIMIT 500",
+    );
+    res.json(r.rows);
+  }),
+);
+app.get(
+  "/api/settings",
+  auth(),
+  asyncRoute(async (_q, res) =>
+    res.json((await pool.query("SELECT * FROM settings")).rows),
+  ),
+);
+app.put(
+  "/api/settings",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const x = z.record(z.string().max(200)).parse(req.body);
+    await tx(async (c) => {
+      for (const [k, v] of Object.entries(x))
+        await c.query(
+          "INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+          [k, v],
+        );
+    });
+    res.json({ ok: true });
+  }),
+);
+app.use((_req, _res, next) => next(error("NOT_FOUND", "Route not found", 404)));
+app.use((e: any, _req: Request, res: Response, _next: NextFunction) => {
+  if (e instanceof z.ZodError)
+    return res.status(400).json({
+      error: {
+        code: "VALIDATION",
+        message: e.issues.map((i) => i.message).join("; "),
+      },
+    });
+  if (e.code === "23505")
+    return res.status(409).json({
+      error: {
+        code: "DUPLICATE",
+        message: "A record with that value already exists",
+      },
+    });
+  if (e.code === "23503")
+    return res.status(409).json({
+      error: {
+        code: "RECORD_IN_USE",
+        message: "This record is still used by another part of the application",
+      },
+    });
+  if (["22007", "22008", "23514"].includes(e.code))
+    return res.status(400).json({
+      error: { code: "VALIDATION", message: "The supplied value is not valid" },
+    });
+  if (e instanceof multer.MulterError)
+    return res.status(400).json({
+      error: {
+        code: "INVALID_IMAGE",
+        message:
+          e.code === "LIMIT_FILE_SIZE"
+            ? "The image must be 5 MB or smaller"
+            : "The image upload is not valid",
+      },
+    });
+  if (!e.status) console.error(e);
+  res.status(e.status || 500).json({
+    error: {
+      code: e.code || "SERVER_ERROR",
+      message: e.status ? e.message : "An unexpected server error occurred",
+    },
+  });
+});
+const port = +process.env.PORT! || 4000;
+let server: ReturnType<typeof app.listen> | undefined;
+
+const start = async () => {
+  await runMigrations();
+  await expireReservations();
+  setInterval(
+    () =>
+      void expireReservations().catch((expirationError) =>
+        console.error("Could not expire reservations", expirationError),
+      ),
+    60_000,
+  ).unref();
+  server = app.listen(port, "0.0.0.0", () => {
+    if (secret === "development-only-change-me")
+      console.warn(
+        "WARNING: JWT_SECRET is using the development default. Set a long random value in .env before exposing this application.",
+      );
+    console.log(`API listening on port ${port}`);
+  });
+};
+
+let shuttingDown = false;
+const shutdown = async (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} received; closing the API safely`);
+  const finish = async () => {
+    await pool.end();
+    process.exit(0);
+  };
+  if (server) server.close(() => void finish());
+  else await finish();
+  setTimeout(() => process.exit(1), 10_000).unref();
+};
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
+
+void start().catch(async (startupError) => {
+  console.error("API startup failed", startupError);
+  await pool.end();
+  process.exit(1);
+});

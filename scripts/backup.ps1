@@ -1,6 +1,16 @@
-$stamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
-$target = Join-Path $PSScriptRoot "..\data\backups\$stamp"
-New-Item -ItemType Directory -Force -Path $target | Out-Null
-docker compose exec -T postgres pg_dump -U inventory -Fc furniture_inventory > (Join-Path $target 'database.dump')
-Copy-Item (Join-Path $PSScriptRoot '..\data\uploads') (Join-Path $target 'uploads') -Recurse -Force -ErrorAction SilentlyContinue
-Write-Host "Backup created: $target"
+$ErrorActionPreference = 'Stop'
+
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+Push-Location $projectRoot
+
+try {
+    docker compose run --rm backup sh /scripts/backup.sh once manual
+    if ($LASTEXITCODE -ne 0) {
+        throw "Backup failed with exit code $LASTEXITCODE."
+    }
+
+    Write-Host "Manual backup completed in data\backups."
+}
+finally {
+    Pop-Location
+}
