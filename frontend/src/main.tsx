@@ -1,5 +1,6 @@
 import React, {
   useEffect as reactUseEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -11,6 +12,7 @@ import {
   NavLink,
   Routes,
   Route,
+  useLocation,
   useParams,
 } from "react-router-dom";
 import "@fontsource/open-sans/latin-400.css";
@@ -627,7 +629,14 @@ function InventoryWithSummary() {
       Object.entries(filters).filter(([, v]) => v) as [string, string][],
     ).toString();
     api("/inventory/products?" + q)
-      .then(setInventoryRows)
+      .then((rows) =>
+        setInventoryRows(
+          rows.map((row: O, displayId: number) => ({
+            ...row,
+            display_id: displayId,
+          })),
+        ),
+      )
       .catch((error) => setErrorMessage(error.message));
   };
   const reload = () => {
@@ -635,7 +644,14 @@ function InventoryWithSummary() {
     loadInventoryTable();
   };
   useEffect(loadPage, []);
-  useEffect(loadInventoryTable, [JSON.stringify(filters)]);
+  useEffect(loadInventoryTable, [
+    filters.productId,
+    filters.supplierId,
+    filters.type,
+    filters.status,
+    filters.from,
+    filters.to,
+  ]);
   return (
     <>
       <h2>Inventory</h2>
@@ -737,11 +753,12 @@ function InventoryWithSummary() {
         cols={[
           [
             "ID",
-            (row, index) => (
+            (row) => (
               <Link className="inventory-id-link" to={`/inventory/${row.id}`}>
-                {index}
+                {row.display_id}
               </Link>
             ),
+            (row) => row.display_id,
           ],
           ["Supplier", (row) => row.supplier_name || "—"],
           ["Product", (row) => row.product_name],
@@ -756,7 +773,12 @@ function InventoryWithSummary() {
           ["Notes", (row) => <NoteButton note={row.notes} label="View" />],
         ]}
       />
-      <Inventory showTitle={false} showHistory={false} onChanged={reload} />
+      <Inventory
+        products={products}
+        showTitle={false}
+        showHistory={false}
+        onChanged={reload}
+      />
       <h3>Inventory actions</h3>
       <MovementTable
         rows={actionRows}
@@ -904,7 +926,7 @@ function InventoryDetail({ admin }: { admin: boolean }) {
           </label>
           <label>
             Current quantity
-            <input value={product.current_quantity} readOnly />
+            <input value={product.current_quantity} readOnly   />
           </label>
           <label>
             Reserved quantity
@@ -968,6 +990,7 @@ function Deliveries() {
       {e && <p className="error">{e}</p>}
       <T
         rows={rows}
+        initialPageSize={5}
         cols={[
           ["Sale ID", (x) => x.sale_number],
           ["Date", (x) => dt(x.business_date)],
@@ -1195,8 +1218,20 @@ function SalesWithBusinessDate() {
       {e && <p className="error">{e}</p>}
       <T
         rows={r}
+        initialPageSize={10}
         cols={[
-          ["Sale #", (x) => x.sale_number],
+          [
+            "ID",
+            (x) => (
+              <Link
+                className="inventory-id-link"
+                to={`/sales/${x.sale_number}`}
+              >
+                {x.sale_number}
+              </Link>
+            ),
+            (x) => +x.sale_number,
+          ],
           ["Sale date", (x) => dt(x.business_date || x.created_at)],
           ["Customer", (x) => x.customer_name || "Walk-in customer"],
           [
@@ -1207,13 +1242,13 @@ function SalesWithBusinessDate() {
                 .join(", "),
           ],
           [
-            "Product cost",
+            "Costed",
             (x) =>
               (x.items || [])
                 .map((a: any) => gel(+a.costPrice * a.quantity))
                 .join(", "),
           ],
-          ["Selling price", (x) => gel(x.total)],
+          ["Sold", (x) => gel(x.total)],
           ["Discount", (x) => gel(x.discount_total)],
           ["Total", (x) => gel(x.total)],
           [
@@ -1222,7 +1257,7 @@ function SalesWithBusinessDate() {
               <PaidEditor sale={x} reload={load} hideValidationMessage />
             ),
           ],
-          ["Remaining", (x) => gel(x.remaining)],
+          ["Remaining", (x) => (+x.remaining === 0 ? "None" : gel(x.remaining))],
           [
             "Status",
             (x) => (
@@ -1252,6 +1287,181 @@ function SalesWithBusinessDate() {
             ),
           ],
           ["Notes", (x) => <NoteButton note={x.notes} />],
+        ]}
+      />
+    </>
+  );
+}
+function SaleDetail() {
+  const { id: saleReference } = useParams();
+  const [sale, setSale] = useState<O>();
+  const [message, setMessage] = useState("");
+  useEffect(() => {
+    if (!saleReference) return;
+    setSale(undefined);
+    setMessage("");
+    api("/sales/" + encodeURIComponent(saleReference))
+      .then(setSale)
+      .catch((error) => setMessage(error.message));
+  }, [saleReference]);
+  if (!sale)
+    return (
+      <>
+        <h2>Sale details</h2>
+        <p className={message ? "error" : ""}>{message || "Loading…"}</p>
+      </>
+    );
+  const paymentMethods = [
+    ...new Set((sale.payments || []).map((payment: O) => payment.method)),
+  ].join(", ");
+  const deliveryDate = sale.delivered_at || sale.delivery_date;
+  return (
+    <>
+      <h2>Sale #{sale.sale_number}</h2>
+      <section className="cards sale-detail-cards">
+        {[
+          ["Total", gel(sale.total)],
+          ["Discount", gel(sale.discount_total)],
+          ["Paid", gel(sale.paid)],
+          ["Remaining", +sale.remaining === 0 ? "None" : gel(sale.remaining)],
+          ["Payment status", sale.paymentStatus],
+          ["Returned value", gel(sale.returnedValue)],
+          ["Refunded", gel(sale.refunded)],
+        ].map(([label, value]) => (
+          <div className="card" key={String(label)}>
+            <small>{label}</small>
+            <strong>{value}</strong>
+          </div>
+        ))}
+      </section>
+      <dl className="sale-detail-summary">
+        <div>
+          <dt>Sale ID</dt>
+          <dd>{sale.sale_number}</dd>
+        </div>
+        <div>
+          <dt>Date</dt>
+          <dd>{dt(sale.business_date || sale.created_at)}</dd>
+        </div>
+        <div>
+          <dt>Customer</dt>
+          <dd>
+            {sale.customer_name
+              ? [sale.customer_name, sale.customer_surname]
+                  .filter(Boolean)
+                  .join(" ")
+              : "—"}
+          </dd>
+        </div>
+        <div>
+          <dt>Customer ID</dt>
+          <dd>
+            {sale.customer_id ? (
+              <Link to={`/customers/${sale.customer_id}`}>
+                {sale.customer_id}
+              </Link>
+            ) : (
+              "—"
+            )}
+          </dd>
+        </div>
+        <div>
+          <dt>Employee</dt>
+          <dd>{sale.employee_name || "—"}</dd>
+        </div>
+        <div>
+          <dt>Payment method</dt>
+          <dd>{paymentMethods || "—"}</dd>
+        </div>
+        <div>
+          <dt>Delivery status</dt>
+          <dd>{sale.delivery_status || "—"}</dd>
+        </div>
+        <div>
+          <dt>Delivery address</dt>
+          <dd>{sale.delivery_address || "—"}</dd>
+        </div>
+        <div>
+          <dt>Delivery date</dt>
+          <dd>{deliveryDate ? dt(deliveryDate) : "—"}</dd>
+        </div>
+        <div>
+          <dt>Notes</dt>
+          <dd>
+            <NoteButton note={sale.notes} label="View" />
+          </dd>
+        </div>
+      </dl>
+      <h3>Products</h3>
+      <T
+        rows={sale.items || []}
+        cols={[
+          ["Product", (item) => item.product_name],
+          [
+            "Product ID",
+            (item) => (
+              <Link to={`/inventory/${item.product_id}`}>
+                {item.product_id}
+              </Link>
+            ),
+          ],
+          ["Supplier", (item) => item.supplier_name || "—"],
+          ["Quantity", (item) => item.quantity],
+          ["Returned", (item) => +item.returned_quantity || "—"],
+          ["Original unit price", (item) => gel(item.regular_unit_price)],
+          ["Final unit price", (item) => gel(item.final_unit_price)],
+          ["Discount per unit", (item) => gel(item.discount_amount)],
+          [
+            "Discount total",
+            (item) => gel(+item.discount_amount * +item.quantity),
+          ],
+          ["Purchase cost per unit", (item) => gel(item.cost_price)],
+          ["Cost total", (item) => gel(+item.cost_price * +item.quantity)],
+          ["Total", (item) => gel(item.line_total)],
+        ]}
+      />
+      <h3>Payments</h3>
+      <T
+        rows={sale.payments || []}
+        cols={[
+          ["Date", (payment) => dt(payment.created_at)],
+          ["Payment method", (payment) => payment.method],
+          ["Amount", (payment) => gel(payment.amount)],
+        ]}
+      />
+      <h3>Returns</h3>
+      <T
+        rows={sale.returns || []}
+        cols={[
+          [
+            "Date",
+            (returned) => dt(returned.business_date || returned.created_at),
+          ],
+          ["Product", (returned) => returned.product_name],
+          ["Quantity", (returned) => returned.quantity],
+          [
+            "Returned value",
+            (returned) => gel(+returned.quantity * +returned.final_unit_price),
+          ],
+          ["Employee", (returned) => returned.employee_name || "—"],
+          [
+            "Notes",
+            (returned) => <NoteButton note={returned.notes} label="View" />,
+          ],
+        ]}
+      />
+      <h3>Refunds</h3>
+      <T
+        rows={sale.refunds || []}
+        cols={[
+          ["Date", (refund) => dt(refund.created_at)],
+          ["Product", (refund) => refund.product_name],
+          ["Amount", (refund) => gel(refund.amount)],
+          ["Employee", (refund) => refund.employee_name || "—"],
+          [
+            "Reason",
+            (refund) => <NoteButton note={refund.reason} label="View" />,
+          ],
         ]}
       />
     </>
@@ -1298,37 +1508,37 @@ async function api(u: string, o: RequestInit = {}): Promise<any> {
     throw Error(d?.error?.message || `Request failed (${r.status})`);
   return d;
 }
-const gel = (n: any) =>
-  new Intl.NumberFormat("en-GE", { style: "currency", currency: "GEL" }).format(
-    +n || 0,
-  );
+const gelFormatter = new Intl.NumberFormat("en-GE", {
+  style: "currency",
+  currency: "GEL",
+});
+const dateFormatter = new Intl.DateTimeFormat("en-GB", {
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+  timeZone: "Asia/Tbilisi",
+});
+const dateTimeFormatter = new Intl.DateTimeFormat("en-GB", {
+  day: "2-digit",
+  month: "2-digit",
+  year: "numeric",
+  hour: "2-digit",
+  minute: "2-digit",
+  timeZone: "Asia/Tbilisi",
+});
+const datePartsFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: "Asia/Tbilisi",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+const gel = (n: any) => gelFormatter.format(+n || 0);
 const dt = (v: any) =>
-  v
-    ? new Intl.DateTimeFormat("en-GB", {
-        day: "2-digit",
-        month: "2-digit",
-        year: "numeric",
-        timeZone: "Asia/Tbilisi",
-      }).format(new Date(v))
-    : "—";
+  v ? dateFormatter.format(new Date(v)) : "—";
 const dtt = (v: any) =>
-  v
-    ? new Intl.DateTimeFormat("en-GB", {
-        day: "2-digit",
-        month: "2-digit",
-        year: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        timeZone: "Asia/Tbilisi",
-      }).format(new Date(v))
-    : "—";
+  v ? dateTimeFormatter.format(new Date(v)) : "—";
 const today = (date: Date | string | number = new Date()) => {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Asia/Tbilisi",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).formatToParts(new Date(date));
+  const parts = datePartsFormatter.formatToParts(new Date(date));
   const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${value.year}-${value.month}-${value.day}`;
 };
@@ -1339,41 +1549,100 @@ const reservationExpiryIso = (value: FormDataEntryValue | null) =>
 function T({
   rows,
   cols,
+  initialPageSize = 20,
 }: {
   rows: O[];
-  cols: [string, (x: O, index: number) => any][];
+  cols: [
+    string,
+    (x: O, index: number) => any,
+    ((x: O) => string | number | null | undefined)?,
+  ][];
+  initialPageSize?: 5 | 10 | 20 | 50 | 100;
 }) {
   const [sort, setSort] = useState<{ index: number; direction: 1 | -1 } | null>(
     null,
   );
-  const value = (row: O, index: number) => {
-    const v = cols[index][1](row, 0);
-    return typeof v === "number"
-      ? v
-      : typeof v === "string"
-        ? v.toLowerCase()
-        : "";
-  };
-  const sorted = sort
-    ? [...rows].sort((a, b) => {
-        const av = value(a, sort.index),
-          bv = value(b, sort.index);
-        return (
-          (typeof av === "number" && typeof bv === "number"
-            ? av - bv
-            : String(av).localeCompare(String(bv))) * sort.direction
-        );
-      })
-    : rows;
-  const toggle = (index: number) =>
+  const [pageSize, setPageSize] = useState(initialPageSize);
+  const [page, setPage] = useState(1);
+  useEffect(() => setPage(1), [rows]);
+  const sorted = useMemo(() => {
+    if (!sort) return rows;
+    const value = (row: O) => {
+      const rendered = cols[sort.index][2]
+        ? cols[sort.index][2]!(row)
+        : cols[sort.index][1](row, 0);
+      return typeof rendered === "number"
+        ? rendered
+        : typeof rendered === "string"
+          ? rendered.toLowerCase()
+          : "";
+    };
+    return [...rows].sort((a, b) => {
+      const av = value(a),
+        bv = value(b);
+      return (
+        (typeof av === "number" && typeof bv === "number"
+          ? av - bv
+          : String(av).localeCompare(String(bv))) * sort.direction
+      );
+    });
+  }, [rows, cols, sort]);
+  const toggle = (index: number) => {
+    setPage(1);
     setSort((s) =>
       s?.index === index
         ? { index, direction: s.direction === 1 ? -1 : 1 }
         : { index, direction: 1 },
     );
+  };
+  const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const firstRow = (currentPage - 1) * pageSize;
+  const visibleRows = sorted.slice(firstRow, firstRow + pageSize);
+  const pageItems: Array<number | string> =
+    pageCount <= 7
+      ? Array.from({ length: pageCount }, (_, index) => index + 1)
+      : currentPage <= 4
+        ? [1, 2, 3, 4, 5, "ellipsis-end", pageCount]
+        : currentPage >= pageCount - 3
+          ? [
+              1,
+              "ellipsis-start",
+              pageCount - 4,
+              pageCount - 3,
+              pageCount - 2,
+              pageCount - 1,
+              pageCount,
+            ]
+          : [
+              1,
+              "ellipsis-start",
+              currentPage - 1,
+              currentPage,
+              currentPage + 1,
+              "ellipsis-end",
+              pageCount,
+            ];
   return (
-    <div className="table">
-      <table>
+    <section className="data-table">
+      <label className="table-record-limit">
+        Show records
+        <select
+          value={pageSize}
+          onChange={(event) => {
+            setPageSize(+event.target.value as 5 | 10 | 20 | 50 | 100);
+            setPage(1);
+          }}
+        >
+          {[5, 10, 20, 50, 100].map((size) => (
+            <option key={size} value={size}>
+              {size}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="table">
+        <table>
         <thead>
           <tr>
             {cols.map((c, index) => (
@@ -1391,10 +1660,10 @@ function T({
           </tr>
         </thead>
         <tbody>
-          {sorted.map((x, i) => (
-            <tr key={x.id || i}>
+          {visibleRows.map((x, index) => (
+            <tr key={x.id || firstRow + index}>
               {cols.map((c) => (
-                <td key={c[0]}>{c[1](x, i)}</td>
+                <td key={c[0]}>{c[1](x, firstRow + index)}</td>
               ))}
             </tr>
           ))}
@@ -1403,9 +1672,51 @@ function T({
               <td colSpan={cols.length}>No records found.</td>
             </tr>
           )}
-        </tbody>
-      </table>
-    </div>
+          </tbody>
+        </table>
+      </div>
+      {pageCount > 1 && (
+        <nav className="table-pagination" aria-label="Table pagination">
+          <span>
+            Showing {firstRow + 1}-
+            {Math.min(firstRow + pageSize, sorted.length)} of {sorted.length}
+          </span>
+          <div className="table-pagination-buttons">
+            <button
+              type="button"
+              disabled={currentPage === 1}
+              onClick={() => setPage(currentPage - 1)}
+            >
+              Previous
+            </button>
+            {pageItems.map((item) =>
+              typeof item === "number" ? (
+                <button
+                  type="button"
+                  className={item === currentPage ? "is-current" : ""}
+                  aria-current={item === currentPage ? "page" : undefined}
+                  key={item}
+                  onClick={() => setPage(item)}
+                >
+                  {item}
+                </button>
+              ) : (
+                <span className="table-pagination-ellipsis" key={item}>
+                  …
+                </span>
+              ),
+            )}
+            <button
+              type="button"
+              disabled={currentPage === pageCount}
+              onClick={() => setPage(currentPage + 1)}
+            >
+              Next
+            </button>
+          </div>
+        </nav>
+      )}
+    </section>
   );
 }
 function NoteButton({
@@ -1685,29 +1996,23 @@ const productImageUiEnabled = false;
 function ProductDetails({
   productId,
   admin,
+  categories,
+  suppliers,
   close,
   reload,
 }: {
   productId: string;
   admin: boolean;
+  categories: O[];
+  suppliers: O[];
   close: () => void;
   reload: () => void;
 }) {
   const [product, setProduct] = useState<O>();
-  const [categories, setCategories] = useState<O[]>([]);
-  const [suppliers, setSuppliers] = useState<O[]>([]);
   const [message, setMessage] = useState("");
   const load = () =>
-    Promise.all([
-      api("/products/" + productId),
-      api("/categories"),
-      api("/suppliers"),
-    ])
-      .then(([details, categoryRows, supplierRows]) => {
-        setProduct(details);
-        setCategories(categoryRows);
-        setSuppliers(supplierRows);
-      })
+    api("/products/" + productId)
+      .then(setProduct)
       .catch((error) => setMessage(error.message));
   useEffect(load, [productId]);
   useEffect(() => {
@@ -1945,7 +2250,12 @@ function Products({ admin }: { admin: boolean }) {
     });
     return api("/products?" + query)
       .then((rows) => {
-        sr(rows);
+        sr(
+          rows.map((product: O, displayId: number) => ({
+            ...product,
+            display_id: displayId,
+          })),
+        );
         se("");
       })
       .catch((x) => se(x.message));
@@ -1977,7 +2287,12 @@ function Products({ admin }: { admin: boolean }) {
       })
       .catch((error) => se(error.message));
   }, []);
-  useEffect(load, [JSON.stringify(filters)]);
+  useEffect(load, [
+    filters.categoryId,
+    filters.supplierId,
+    filters.minPrice,
+    filters.maxPrice,
+  ]);
   return (
     <>
       <h2>Products</h2>
@@ -2121,6 +2436,8 @@ function Products({ admin }: { admin: boolean }) {
         <ProductDetails
           productId={selectedProductId}
           admin={admin}
+          categories={categories}
+          suppliers={suppliers}
           close={() => setSelectedProductId(undefined)}
           reload={load}
         />
@@ -2130,14 +2447,15 @@ function Products({ admin }: { admin: boolean }) {
         cols={[
           [
             "ID",
-            (product, index) => (
+            (product) => (
               <Link
                 className="inventory-id-link"
                 to={`/inventory/${product.id}`}
               >
-                {index}
+                {product.display_id}
               </Link>
             ),
+            (product) => product.display_id,
           ],
           ["Name", (x) => x.name],
           ["Category", (x) => x.category_name || "—"],
@@ -2162,6 +2480,330 @@ function Products({ admin }: { admin: boolean }) {
           ],
         ]}
       />
+    </>
+  );
+}
+function CustomerChangesButton({ changes }: { changes: O[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        className="note-button customer-changes-button"
+        type="button"
+        onClick={() => setOpen(true)}
+      >
+        Changes
+      </button>
+      {open && (
+        <div className="modal-backdrop" onClick={() => setOpen(false)}>
+          <div
+            className="modal customer-changes-modal"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <h3>Customer modification history</h3>
+            {changes.map((change) => (
+              <section className="customer-change-record" key={change.id}>
+                <h4>{historyLabel(change.type)}</h4>
+                <dl className="change-details">
+                  <div>
+                    <dt>Field changed</dt>
+                    <dd>{historyLabel(change.field_name || "—")}</dd>
+                  </div>
+                  <div>
+                    <dt>Old value</dt>
+                    <dd>{historyValue(change.old_value)}</dd>
+                  </div>
+                  <div>
+                    <dt>New value</dt>
+                    <dd>{historyValue(change.new_value)}</dd>
+                  </div>
+                  <div>
+                    <dt>Changed by</dt>
+                    <dd>{change.user_name || "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Date</dt>
+                    <dd>{dtt(change.occurred_at)}</dd>
+                  </div>
+                </dl>
+              </section>
+            ))}
+            {!changes.length && <p>No customer changes recorded.</p>}
+            <button type="button" onClick={() => setOpen(false)}>
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+function CustomersPage() {
+  const [customers, setCustomers] = useState<O[]>([]),
+    [message, setMessage] = useState("");
+  const load = () =>
+    api("/customers")
+      .then((rows) => {
+        setCustomers(
+          [...rows]
+            .sort((a, b) => {
+              const createdDifference =
+                new Date(a.created_at).getTime() -
+                new Date(b.created_at).getTime();
+              return createdDifference || String(a.id).localeCompare(String(b.id));
+            })
+            .map((customer, displayId) => ({
+              ...customer,
+              display_id: displayId,
+            })),
+        );
+        setMessage("");
+      })
+      .catch((error) => setMessage(error.message));
+  useEffect(load, []);
+  return (
+    <>
+      <h2>Customers</h2>
+      <form
+        className="inline customer-create-form"
+        onSubmit={async (event) => {
+          event.preventDefault();
+          const form = event.currentTarget;
+          const values = new FormData(form);
+          try {
+            await api("/customers", {
+              method: "POST",
+              body: JSON.stringify({
+                name: values.get("name"),
+                surname: values.get("surname") || null,
+                address: values.get("address") || null,
+                phone: values.get("phone") || null,
+                nationality: values.get("nationality") || null,
+                notes: values.get("notes") || null,
+              }),
+            });
+            form.reset();
+            void load();
+          } catch (error: any) {
+            setMessage(error.message);
+          }
+        }}
+      >
+        <label>
+          Name
+          <input name="name" required />
+        </label>
+        <label>
+          Surname (optional)
+          <input name="surname" />
+        </label>
+        <label>
+          Address
+          <input name="address" />
+        </label>
+        <label>
+          Phone
+          <input name="phone" />
+        </label>
+        <label>
+          Nationality (optional)
+          <input name="nationality" />
+        </label>
+        <label>
+          Notes
+          <input name="notes" />
+        </label>
+        <button className="form-submit">Add Customer</button>
+      </form>
+      {message && <p className="error">{message}</p>}
+      <T
+        rows={customers}
+        initialPageSize={20}
+        cols={[
+          [
+            "ID",
+            (customer) => (
+              <Link
+                className="inventory-id-link"
+                to={`/customers/${customer.id}`}
+              >
+                {customer.display_id}
+              </Link>
+            ),
+            (customer) => customer.display_id,
+          ],
+          ["Name", (customer) => customer.name],
+          ["Surname", (customer) => customer.surname || "—"],
+          ["Phone", (customer) => customer.phone || "—"],
+          ["Address", (customer) => customer.address || "—"],
+          ["Nationality", (customer) => customer.nationality || "—"],
+          ["Notes", (customer) => <NoteButton note={customer.notes} />],
+        ]}
+      />
+    </>
+  );
+}
+function CustomerDetail() {
+  const { id: customerId } = useParams();
+  const [details, setDetails] = useState<O>();
+  const [message, setMessage] = useState("");
+  const load = () => {
+    if (!customerId) return;
+    return api("/customers/" + customerId + "/history")
+      .then((result) => {
+        setDetails(result);
+        setMessage("");
+      })
+      .catch((error) => setMessage(error.message));
+  };
+  useEffect(load, [customerId]);
+  if (!details)
+    return (
+      <>
+        <h2>Customer details</h2>
+        <p className={message ? "error" : ""}>{message || "Loading…"}</p>
+      </>
+    );
+  const customer = details.customer;
+  const statistics = details.statistics;
+  return (
+    <>
+      <h2>Customer details</h2>
+      <div className="customer-detail-layout">
+        <div className="customer-change-panel">
+          <CustomerChangesButton changes={details.changes || []} />
+        </div>
+        <div className="customer-detail-content">
+          <section className="cards customer-statistics">
+            {[
+              ["Total amount spent", gel(statistics.totalSpent)],
+              ["Total discount received", gel(statistics.totalDiscount)],
+              ["Outstanding debt", gel(statistics.outstandingDebt)],
+              [
+                "Active reservation balance",
+                gel(statistics.activeReservationBalance),
+              ],
+              [
+                "Last purchase date",
+                statistics.lastPurchaseDate
+                  ? dt(statistics.lastPurchaseDate)
+                  : "—",
+              ],
+              ["Last purchased item", statistics.lastPurchasedItem || "—"],
+            ].map(([label, value]) => (
+              <div className="card" key={String(label)}>
+                <small>{label}</small>
+                <strong>{value}</strong>
+              </div>
+            ))}
+          </section>
+          <form
+            key={customer.updated_at}
+            className="customer-detail-form"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              if (!customerId) return;
+              const values = new FormData(event.currentTarget);
+              try {
+                await api("/customers/" + customerId, {
+                  method: "PATCH",
+                  body: JSON.stringify({
+                    name: values.get("name"),
+                    surname: values.get("surname") || null,
+                    address: values.get("address") || null,
+                    phone: values.get("phone") || null,
+                    nationality: values.get("nationality") || null,
+                  }),
+                });
+                await load();
+                setMessage("Customer details saved successfully.");
+              } catch (error: any) {
+                setMessage(error.message);
+              }
+            }}
+          >
+            <label>
+              Name
+              <input name="name" defaultValue={customer.name} required />
+            </label>
+            <label>
+              Surname (optional)
+              <input name="surname" defaultValue={customer.surname || ""} />
+            </label>
+            <label>
+              Address
+              <input name="address" defaultValue={customer.address || ""} />
+            </label>
+            <label>
+              Phone
+              <input name="phone" defaultValue={customer.phone || ""} />
+            </label>
+            <label>
+              Nationality (optional)
+              <input
+                name="nationality"
+                defaultValue={customer.nationality || ""}
+              />
+            </label>
+            <button className="form-submit">Save</button>
+          </form>
+          {message && (
+            <p className={message.includes("success") ? "" : "error"}>
+              {message}
+            </p>
+          )}
+          <h3>Purchase history</h3>
+          <T
+            rows={details.purchases || []}
+            cols={[
+              ["Date", (sale) => dt(sale.business_date)],
+              ["Sale ID", (sale) => sale.sale_number],
+              ["Product", (sale) => sale.product_names || "—"],
+              ["Address", (sale) => sale.delivery_address || "—"],
+              [
+                "Delivery Date",
+                (sale) =>
+                  sale.actual_delivery_date
+                    ? dt(sale.actual_delivery_date)
+                    : "—",
+              ],
+              [
+                "Delivery Status",
+                (sale) => sale.delivery_status || "—",
+              ],
+              ["Paid", (sale) => gel(sale.paid)],
+              ["Discount", (sale) => gel(sale.discount)],
+              ["Payment Method", (sale) => sale.payment_methods || "—"],
+              ["Status", (sale) => <StatusValue value={sale.status} />],
+            ]}
+          />
+          <h3>Reservation history</h3>
+          <T
+            rows={details.reservations || []}
+            cols={[
+              ["Date", (reservation) => dt(reservation.created_at)],
+              ["Product", (reservation) => reservation.product_name],
+              ["Quantity", (reservation) => reservation.quantity],
+              [
+                "Total",
+                (reservation) => gel(reservation.reservation_total),
+              ],
+              ["Paid", (reservation) => gel(reservation.deposit_paid)],
+              ["Remaining", (reservation) => gel(reservation.remaining)],
+              [
+                "Expires",
+                (reservation) =>
+                  reservation.expires_at ? dt(reservation.expires_at) : "—",
+              ],
+              [
+                "Status",
+                (reservation) => <StatusValue value={reservation.status} />,
+              ],
+              ["Notes", (reservation) => <NoteButton note={reservation.notes} />],
+            ]}
+          />
+        </div>
+      </div>
     </>
   );
 }
@@ -2323,25 +2965,28 @@ function MovementTable({
   return <T rows={display} cols={cols} />;
 }
 function Inventory({
+  products: suppliedProducts,
   showTitle = true,
   showHistory = true,
   onChanged,
 }: {
+  products?: O[];
   showTitle?: boolean;
   showHistory?: boolean;
   onChanged?: () => void;
 } = {}) {
-  const [p, sp] = useState<O[]>([]),
+  const [loadedProducts, setLoadedProducts] = useState<O[]>([]),
     [h, sh] = useState<O[]>([]),
     [e, se] = useState(""),
     [reason, setReason] = useState("RETURN"),
     [qty, setQty] = useState("1"),
     [direction, setDirection] = useState("INCREASE");
+  const p = suppliedProducts ?? loadedProducts;
   const load = () => {
-    api("/products").then(sp);
+    if (!suppliedProducts) api("/products").then(setLoadedProducts);
     if (showHistory) api("/stock-movements").then(sh);
   };
-  useEffect(load, []);
+  useEffect(load, [suppliedProducts, showHistory]);
   const submit =
     (url: string) => async (x: React.FormEvent<HTMLFormElement>) => {
       x.preventDefault();
@@ -2396,7 +3041,7 @@ function Inventory({
   return (
     <>
       {showTitle && <h2>Inventory</h2>}
-      <div className="twocol">
+      <div className="twocol inventory-action-forms">
         <form onSubmit={submit("/inventory/import")}>
           <h3>Import</h3>
           <label>Product{pick}</label>
@@ -2523,64 +3168,77 @@ function History() {
       })
       .catch((error) => setErrorMessage(error.message));
   useEffect(load, []);
-  const types = [...new Set(h.map((row) => String(row.type || "")).filter(Boolean))].sort();
-  const statuses = [
-    ...new Set(h.map((row) => String(row.status || "")).filter(Boolean)),
-  ].sort();
-  const employees = [
-    ...new Map(
-      h
-        .filter((row) => row.user_id && row.employee_name)
-        .map((row) => [row.user_id, row.employee_name]),
-    ).entries(),
-  ].sort((a, b) => String(a[1]).localeCompare(String(b[1])));
-  const dateKey = (row: O) => {
-    const value = row.display_date || row.created_at;
-    if (typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value))
-      return value.slice(0, 10);
-    return today(value);
-  };
-  const filtered = h.filter((row) => {
-    const productIds = (row.product_ids || [row.product_id]).filter(Boolean);
-    const supplierIds = (row.supplier_ids || [row.supplier_id]).filter(Boolean);
-    const searchable = [
-      row.type,
-      row.status,
-      row.product_name,
-      row.supplier_name,
-      row.customer_name,
-      row.employee_name,
-      row.notes,
-      row.target_name,
-      row.sale_number,
-      row.field_name,
-      row.old_value,
-      row.new_value,
-      JSON.stringify(row.audit_details || {}),
-    ]
-      .filter((value) => value !== null && value !== undefined)
-      .join(" ")
-      .toLowerCase();
-    const rowDate = dateKey(row);
-    return (
-      (!filters.from || rowDate >= filters.from) &&
-      (!filters.to || rowDate <= filters.to) &&
-      (!filters.productId || productIds.includes(filters.productId)) &&
-      (!filters.supplierId || supplierIds.includes(filters.supplierId)) &&
-      (!filters.type || row.type === filters.type) &&
-      (!filters.status || row.status === filters.status) &&
-      (!filters.userId || row.user_id === filters.userId) &&
-      (!filters.search || searchable.includes(filters.search.toLowerCase()))
-    );
-  });
-  const display = filtered.map((x) =>
-    x.type === "SALE" && x.sale_selling_price != null
-      ? {
-          ...x,
-          product_name: `${x.product_name} | Selling Price: ${gel(x.sale_selling_price)}`,
-        }
-      : { ...x, product_name: x.product_name || "—" },
+  const { types, statuses, employees } = useMemo(
+    () => ({
+      types: [
+        ...new Set(h.map((row) => String(row.type || "")).filter(Boolean)),
+      ].sort(),
+      statuses: [
+        ...new Set(h.map((row) => String(row.status || "")).filter(Boolean)),
+      ].sort(),
+      employees: [
+        ...new Map(
+          h
+            .filter((row) => row.user_id && row.employee_name)
+            .map((row) => [row.user_id, row.employee_name]),
+        ).entries(),
+      ].sort((a, b) => String(a[1]).localeCompare(String(b[1]))),
+    }),
+    [h],
   );
+  const display = useMemo(() => {
+    const search = filters.search.toLowerCase();
+    return h
+      .filter((row) => {
+        const productIds = (row.product_ids || [row.product_id]).filter(
+          Boolean,
+        );
+        const supplierIds = (row.supplier_ids || [row.supplier_id]).filter(
+          Boolean,
+        );
+        const value = row.display_date || row.created_at;
+        const rowDate =
+          typeof value === "string" && /^\d{4}-\d{2}-\d{2}/.test(value)
+            ? value.slice(0, 10)
+            : today(value);
+        const searchable = [
+          row.type,
+          row.status,
+          row.product_name,
+          row.supplier_name,
+          row.customer_name,
+          row.employee_name,
+          row.notes,
+          row.target_name,
+          row.sale_number,
+          row.field_name,
+          row.old_value,
+          row.new_value,
+          JSON.stringify(row.audit_details || {}),
+        ]
+          .filter((field) => field !== null && field !== undefined)
+          .join(" ")
+          .toLowerCase();
+        return (
+          (!filters.from || rowDate >= filters.from) &&
+          (!filters.to || rowDate <= filters.to) &&
+          (!filters.productId || productIds.includes(filters.productId)) &&
+          (!filters.supplierId || supplierIds.includes(filters.supplierId)) &&
+          (!filters.type || row.type === filters.type) &&
+          (!filters.status || row.status === filters.status) &&
+          (!filters.userId || row.user_id === filters.userId) &&
+          (!search || searchable.includes(search))
+        );
+      })
+      .map((row) =>
+        row.type === "SALE" && row.sale_selling_price != null
+          ? {
+              ...row,
+              product_name: `${row.product_name} | Selling Price: ${gel(row.sale_selling_price)}`,
+            }
+          : { ...row, product_name: row.product_name || "—" },
+      );
+  }, [h, filters]);
   return (
     <>
       <h2>History</h2>
@@ -2747,7 +3405,7 @@ function PaidEditor({
     }
   };
   return (
-    <span>
+    <span className="paid-editor">
       <NumericInput
         className="paid-input"
         hideValidationMessage={hideValidationMessage}
@@ -2921,6 +3579,7 @@ function Reservations() {
       {e && <p className="error">{e}</p>}
       <T
         rows={r}
+        initialPageSize={5}
         cols={[
           ["Product", (x) => x.product_name],
           ["Customer", (x) => x.customer_name || "—"],
@@ -2939,7 +3598,7 @@ function Reservations() {
                   x.display_status === "COMPLETED"
                     ? "Sold"
                     : x.display_status === "CANCELLED"
-                      ? "Cancelled reservation"
+                      ? "Cancelled"
                       : x.display_status
                 }
               />
@@ -3117,6 +3776,8 @@ function NavigationDropdown({
   );
 }
 function Shell({ u, out }: { u: O; out: () => void }) {
+  const location = useLocation();
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const primaryNavigation = [
     "Dashboard",
     "Products",
@@ -3126,35 +3787,62 @@ function Shell({ u, out }: { u: O; out: () => void }) {
     "Payments",
     "Deliveries",
   ];
+  useEffect(() => setMobileNavigationOpen(false), [location.pathname]);
+  useEffect(() => {
+    if (!mobileNavigationOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMobileNavigationOpen(false);
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [mobileNavigationOpen]);
   return (
     <div className="shell">
       <aside>
         <h1>
           <ShopTitle />
         </h1>
-        {primaryNavigation.map((x) => (
-          <NavLink
-            key={x}
-            to={x === "Dashboard" ? "/" : "/" + x.toLowerCase()}
-            end={x === "Dashboard"}
-          >
-            {x}
-          </NavLink>
-        ))}
-        <NavigationDropdown label="Contacts">
-          <NavLink to="/customers">Customers</NavLink>
-          <NavLink to="/suppliers">Suppliers</NavLink>
-          <NavLink to="/contacts">Contacts</NavLink>
-        </NavigationDropdown>
-        <NavLink to="/history">History</NavLink>
-        {u.role === "ADMIN" && <NavLink to="/reports">Reports</NavLink>}
-        <NavigationDropdown label="Other">
-          {u.role === "ADMIN" && (
-            <NavLink to="/employees">Employees</NavLink>
-          )}
-          <NavLink to="/settings">Settings</NavLink>
-          <button onClick={out}>Sign out</button>
-        </NavigationDropdown>
+        <button
+          type="button"
+          className="mobile-nav-toggle"
+          aria-controls="primary-navigation"
+          aria-expanded={mobileNavigationOpen}
+          onClick={() => setMobileNavigationOpen((current) => !current)}
+        >
+          <span className="mobile-nav-icon" aria-hidden="true">
+            {mobileNavigationOpen ? "×" : "☰"}
+          </span>
+          <span>{mobileNavigationOpen ? "Close" : "Menu"}</span>
+        </button>
+        <nav
+          id="primary-navigation"
+          className={`sidebar-navigation ${mobileNavigationOpen ? "is-open" : ""}`}
+          aria-label="Main navigation"
+        >
+          {primaryNavigation.map((x) => (
+            <NavLink
+              key={x}
+              to={x === "Dashboard" ? "/" : "/" + x.toLowerCase()}
+              end={x === "Dashboard"}
+            >
+              {x}
+            </NavLink>
+          ))}
+          <NavigationDropdown label="Contacts">
+            <NavLink to="/customers">Customers</NavLink>
+            <NavLink to="/suppliers">Suppliers</NavLink>
+            <NavLink to="/contacts">Contacts</NavLink>
+          </NavigationDropdown>
+          <NavLink to="/history">History</NavLink>
+          {u.role === "ADMIN" && <NavLink to="/reports">Reports</NavLink>}
+          <NavigationDropdown label="Other">
+            {u.role === "ADMIN" && (
+              <NavLink to="/employees">Employees</NavLink>
+            )}
+            <NavLink to="/settings">Settings</NavLink>
+            <button onClick={out}>Sign out</button>
+          </NavigationDropdown>
+        </nav>
       </aside>
       <main>
         <Routes>
@@ -3169,19 +3857,12 @@ function Shell({ u, out }: { u: O; out: () => void }) {
             element={<InventoryDetail admin={u.role === "ADMIN"} />}
           />
           <Route path="/sales" element={<SalesWithBusinessDate />} />
+          <Route path="/sales/:id" element={<SaleDetail />} />
           <Route path="/reservations" element={<Reservations />} />
           <Route path="/payments" element={<Payments />} />
           <Route path="/deliveries" element={<Deliveries />} />
-          <Route
-            path="/customers"
-            element={
-              <Resource
-                title="Customers"
-                url="/customers"
-                fields={["name", "phone", "address", "notes"]}
-              />
-            }
-          />
+          <Route path="/customers" element={<CustomersPage />} />
+          <Route path="/customers/:id" element={<CustomerDetail />} />
           <Route
             path="/suppliers"
             element={

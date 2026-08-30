@@ -120,15 +120,19 @@ const productEvent = async (
   action: string,
   notes?: string,
   change?: { fieldName: string; oldValue: string; newValue: string },
+  knownProductName?: string,
 ) => {
-  const p = productId
-    ? await c.query("SELECT name FROM products WHERE id=$1", [productId])
-    : { rows: [{ name: null }] };
+  const productName =
+    knownProductName ??
+    (productId
+      ? (await c.query("SELECT name FROM products WHERE id=$1", [productId]))
+          .rows[0]?.name
+      : null);
   return c.query(
     "INSERT INTO product_events(product_id,product_name,action,field_name,old_value,new_value,user_id,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
     [
       productId || null,
-      p.rows[0]?.name || null,
+      productName || null,
       action,
       change?.fieldName || null,
       change?.oldValue ?? null,
@@ -162,6 +166,15 @@ const positiveInteger = numericValue
   .refine(Number.isInteger, "Enter a whole number")
   .refine((value) => value > 0, "Enter a number greater than zero");
 const qty = positiveInteger;
+const withSaleBalance = <T extends Record<string, any>>(sale: T) => ({
+  ...sale,
+  ...calculateSaleBalance(
+    +sale.total,
+    +sale.gross_paid,
+    +sale.refunded,
+    +sale.returned_value,
+  ),
+});
 const dateOnly = z
   .string()
   .refine(isValidDateOnly, "Choose a valid calendar date");
@@ -185,6 +198,10 @@ const contactSchema = z.object({
   email: z.string().email().optional().or(z.literal("")).nullable(),
   address: z.string().optional().nullable(),
   notes: z.string().optional().nullable(),
+});
+const customerSchema = contactSchema.extend({
+  surname: z.string().optional().nullable(),
+  nationality: z.string().optional().nullable(),
 });
 
 app.get(
@@ -287,28 +304,44 @@ function listResource(table: string, columns = "*", searchPhone = true) {
 }
 function contactRoutes(name: string, table: string, adminWrite = false) {
   const entityType = name.slice(0, -1).toUpperCase();
+  const schema = table === "customers" ? customerSchema : contactSchema;
   app.get(`/api/${name}`, auth(), listResource(table));
   app.post(
     `/api/${name}`,
     auth(adminWrite ? ["ADMIN"] : undefined),
     asyncRoute(async (req, res) => {
-      const x = contactSchema.parse(req.body);
+      const x = schema.parse(req.body);
       const created = await tx(async (c) => {
+        const customerFields = table === "customers";
         const r = await c.query(
-          `INSERT INTO ${table}(name,phone,email,address,notes) VALUES($1,$2,$3,$4,$5) RETURNING *`,
-          [
-            x.name,
-            x.phone || null,
-            x.email || null,
-            x.address || null,
-            x.notes || null,
-          ],
+          customerFields
+            ? `INSERT INTO ${table}(name,surname,phone,email,address,nationality,notes) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`
+            : `INSERT INTO ${table}(name,phone,email,address,notes) VALUES($1,$2,$3,$4,$5) RETURNING *`,
+          customerFields
+            ? [
+                x.name,
+                (x as any).surname || null,
+                x.phone || null,
+                x.email || null,
+                x.address || null,
+                (x as any).nationality || null,
+                x.notes || null,
+              ]
+            : [
+                x.name,
+                x.phone || null,
+                x.email || null,
+                x.address || null,
+                x.notes || null,
+              ],
         );
         await audit(c, req.user!, "CREATE", entityType, r.rows[0].id, {
           name: r.rows[0].name,
+          surname: r.rows[0].surname,
           phone: r.rows[0].phone,
           email: r.rows[0].email,
           address: r.rows[0].address,
+          nationality: r.rows[0].nationality,
           notes: r.rows[0].notes,
         });
         return r.rows[0];
@@ -320,7 +353,7 @@ function contactRoutes(name: string, table: string, adminWrite = false) {
     `/api/${name}/:id`,
     auth(adminWrite ? ["ADMIN"] : undefined),
     asyncRoute(async (req, res) => {
-      const x = contactSchema.partial().parse(req.body);
+      const x = schema.partial().parse(req.body);
       const keys = Object.keys(x);
       if (!keys.length) throw error("VALIDATION", "No changes supplied");
       const entityId = id.parse(req.params.id);
@@ -335,7 +368,24 @@ function contactRoutes(name: string, table: string, adminWrite = false) {
           [...Object.values(x), entityId],
         );
         const changes = changedValues(before.rows[0], r.rows[0], keys);
-        if (Object.keys(changes).length)
+        if (table === "customers") {
+          for (const [field, change] of Object.entries(changes) as [
+            string,
+            { oldValue: any; newValue: any },
+          ][])
+            await audit(
+              c,
+              req.user!,
+              `${field.toUpperCase()}_CHANGED`,
+              entityType,
+              entityId,
+              {
+                fieldName: field.toUpperCase(),
+                oldValue: change.oldValue,
+                newValue: change.newValue,
+              },
+            );
+        } else if (Object.keys(changes).length)
           await audit(c, req.user!, "UPDATE", entityType, entityId, {
             name: r.rows[0].name,
             changes,
@@ -582,7 +632,15 @@ app.post(
           x.color,
         ],
       );
-      await productEvent(c, req.user!, r.rows[0].id, "PRODUCT_CREATED");
+      await productEvent(
+        c,
+        req.user!,
+        r.rows[0].id,
+        "PRODUCT_CREATED",
+        undefined,
+        undefined,
+        r.rows[0].name,
+      );
       await audit(c, req.user!, "CREATE", "PRODUCT", r.rows[0].id);
       return r.rows[0];
     });
@@ -694,6 +752,7 @@ app.patch(
           action,
           `Old: ${oldValue}\nNew: ${newValue}\nUser: ${req.user!.name}`,
           { fieldName, oldValue, newValue },
+          after.name,
         );
       }
       await audit(c, req.user!, "UPDATE", "PRODUCT", productId, {
@@ -711,7 +770,7 @@ app.delete(
     const productId = id.parse(req.params.id);
     const result = await tx(async (c) => {
       const product = await c.query(
-        "SELECT id,is_active FROM products WHERE id=$1 FOR UPDATE",
+        "SELECT id,name,is_active FROM products WHERE id=$1 FOR UPDATE",
         [productId],
       );
       if (!product.rowCount) throw error("NOT_FOUND", "Product not found", 404);
@@ -725,7 +784,15 @@ app.delete(
             "UPDATE products SET is_active=false,updated_at=now() WHERE id=$1",
             [productId],
           );
-          await productEvent(c, req.user!, productId, "PRODUCT_ARCHIVED");
+          await productEvent(
+            c,
+            req.user!,
+            productId,
+            "PRODUCT_ARCHIVED",
+            undefined,
+            undefined,
+            product.rows[0].name,
+          );
           await audit(c, req.user!, "ARCHIVE", "PRODUCT", productId);
         }
         return {
@@ -738,7 +805,15 @@ app.delete(
         "SELECT storage_path FROM product_images WHERE product_id=$1",
         [productId],
       );
-      await productEvent(c, req.user!, productId, "PRODUCT_DELETED");
+      await productEvent(
+        c,
+        req.user!,
+        productId,
+        "PRODUCT_DELETED",
+        undefined,
+        undefined,
+        product.rows[0].name,
+      );
       await c.query("DELETE FROM products WHERE id=$1", [productId]);
       await audit(c, req.user!, "DELETE", "PRODUCT", productId);
       return {
@@ -1378,12 +1453,17 @@ async function createSale(
   let subtotal = 0,
     discount = 0;
   const items: any[] = [];
+  const productIds = [...new Set(x.items.map((item) => item.productId))];
+  const lockedProducts = await c.query(
+    "SELECT * FROM products WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+    [productIds],
+  );
+  const productById = new Map(
+    lockedProducts.rows.map((product) => [product.id, product]),
+  );
   for (const i of x.items) {
-    const p = await c.query("SELECT * FROM products WHERE id=$1 FOR UPDATE", [
-      i.productId,
-    ]);
-    if (!p.rowCount) throw error("NOT_FOUND", "Product not found", 404);
-    const product = p.rows[0];
+    const product = productById.get(i.productId);
+    if (!product) throw error("NOT_FOUND", "Product not found", 404);
     if (
       product.current_quantity - product.reserved_quantity < i.quantity &&
       !reservationId
@@ -1532,15 +1612,7 @@ app.get(
         q ? [`%${q}%`] : [],
       );
     res.json(
-      r.rows.map((sale) => {
-        const balance = calculateSaleBalance(
-          +sale.total,
-          +sale.gross_paid,
-          +sale.refunded,
-          +sale.returned_value,
-        );
-        return { ...sale, ...balance };
-      }),
+      r.rows.map(withSaleBalance),
     );
   }),
 );
@@ -1565,20 +1637,123 @@ app.get(
   "/api/sales/:id",
   auth(),
   asyncRoute(async (req, res) => {
-    const sid = id.parse(req.params.id);
+    const reference = String(req.params.id);
+    const isSaleNumber = /^[1-9]\d*$/.test(reference);
+    if (!isSaleNumber) id.parse(reference);
     const sale = await pool.query(
-      "SELECT s.*,c.name customer_name,u.name employee_name FROM sales s LEFT JOIN customers c ON c.id=s.customer_id JOIN users u ON u.id=s.employee_id WHERE s.id=$1",
-      [sid],
+      `SELECT
+         s.*,
+         c.name customer_name,
+         c.surname customer_surname,
+         u.name employee_name,
+         delivery.delivered_at
+       FROM sales s
+       LEFT JOIN customers c ON c.id=s.customer_id
+       JOIN users u ON u.id=s.employee_id
+       LEFT JOIN LATERAL (
+         SELECT max(created_at) delivered_at
+         FROM audit_logs
+         WHERE entity_type='SALE'
+           AND entity_id=s.id
+           AND action='DELIVERED'
+       ) delivery ON true
+       WHERE ${isSaleNumber ? "s.sale_number" : "s.id"}=$1`,
+      [reference],
     );
     if (!sale.rowCount) throw error("NOT_FOUND", "Sale not found", 404);
-    const [items, payments] = await Promise.all([
+    const sid = sale.rows[0].id;
+    const [items, payments, returns, refunds] = await Promise.all([
       pool.query(
-        "SELECT si.*,p.name product_name FROM sale_items si JOIN products p ON p.id=si.product_id WHERE sale_id=$1",
+        `SELECT
+           si.*,
+           p.name product_name,
+           supplier.name supplier_name,
+           COALESCE(returned.quantity,0) returned_quantity
+         FROM sale_items si
+         JOIN products p ON p.id=si.product_id
+         LEFT JOIN suppliers supplier ON supplier.id=si.supplier_id
+         LEFT JOIN LATERAL (
+           SELECT sum(quantity) quantity
+           FROM stock_movements
+           WHERE reference_id=si.id
+             AND type='RETURN'
+             AND deleted_at IS NULL
+         ) returned ON true
+         WHERE si.sale_id=$1
+         ORDER BY si.id`,
         [sid],
       ),
-      pool.query("SELECT * FROM sale_payments WHERE sale_id=$1", [sid]),
+      pool.query(
+        "SELECT * FROM sale_payments WHERE sale_id=$1 ORDER BY created_at,id",
+        [sid],
+      ),
+      pool.query(
+        `SELECT
+           movement.id,
+           movement.business_date,
+           movement.created_at,
+           movement.quantity,
+           movement.notes,
+           item.id sale_item_id,
+           item.product_id,
+           item.final_unit_price,
+           product.name product_name,
+           employee.name employee_name
+         FROM stock_movements movement
+         JOIN sale_items item ON item.id=movement.reference_id
+         JOIN products product ON product.id=item.product_id
+         JOIN users employee ON employee.id=movement.user_id
+         WHERE item.sale_id=$1
+           AND movement.type='RETURN'
+           AND movement.deleted_at IS NULL
+         ORDER BY COALESCE(movement.business_date,movement.created_at::date) DESC,
+                  movement.created_at DESC`,
+        [sid],
+      ),
+      pool.query(
+        `SELECT
+           refund.*,
+           item.product_id,
+           product.name product_name,
+           employee.name employee_name
+         FROM sale_refunds refund
+         JOIN sale_items item ON item.id=refund.sale_item_id
+         JOIN products product ON product.id=item.product_id
+         JOIN users employee ON employee.id=refund.created_by
+         WHERE refund.sale_id=$1
+         ORDER BY refund.created_at DESC,refund.id`,
+        [sid],
+      ),
     ]);
-    res.json({ ...sale.rows[0], items: items.rows, payments: payments.rows });
+    const grossPaid = payments.rows.reduce(
+      (sum, payment) => sum + +payment.amount,
+      0,
+    );
+    const refunded = refunds.rows.reduce(
+      (sum, refund) => sum + +refund.amount,
+      0,
+    );
+    const returnedValue = returns.rows.reduce(
+      (sum, returned) =>
+        sum + +returned.quantity * +returned.final_unit_price,
+      0,
+    );
+    res.json({
+      ...sale.rows[0],
+      ...calculateSaleBalance(
+        +sale.rows[0].total,
+        grossPaid,
+        refunded,
+        returnedValue,
+      ),
+      grossPaid,
+      refunded,
+      returnedValue,
+      items: items.rows,
+      payments: payments.rows,
+      returns: returns.rows,
+      refunds: refunds.rows,
+    });
   }),
 );
 app.put(
@@ -2155,40 +2330,185 @@ app.get(
   auth(),
   asyncRoute(async (req, res) => {
     const cid = id.parse(req.params.id);
-    const c = await pool.query("SELECT * FROM customers WHERE id=$1", [cid]);
-    if (!c.rowCount) throw error("NOT_FOUND", "Customer not found", 404);
-    const sales = await pool.query(
-      `SELECT
-         s.*,
-         COALESCE((SELECT sum(amount) FROM sale_payments WHERE sale_id=s.id), 0) AS gross_paid,
-         COALESCE((SELECT sum(amount) FROM sale_refunds WHERE sale_id=s.id), 0) AS refunded,
-         COALESCE((
-           SELECT sum(sm.quantity * si.final_unit_price)
-           FROM sale_items si
-           JOIN stock_movements sm
-             ON sm.reference_id=si.id
-            AND sm.type='RETURN'
-            AND sm.deleted_at IS NULL
-           WHERE si.sale_id=s.id
-         ), 0) AS returned_value
-       FROM sales s
-       WHERE customer_id=$1
-       ORDER BY business_date DESC, created_at DESC`,
-      [cid],
-    );
-    const history = sales.rows.map((sale) => ({
-      ...sale,
-      ...calculateSaleBalance(
-        +sale.total,
-        +sale.gross_paid,
-        +sale.refunded,
-        +sale.returned_value,
+    await expireReservations();
+    const customer = await pool.query("SELECT * FROM customers WHERE id=$1", [
+      cid,
+    ]);
+    if (!customer.rowCount)
+      throw error("NOT_FOUND", "Customer not found", 404);
+    const [sales, reservations, auditChanges] = await Promise.all([
+      pool.query(
+        `SELECT
+           sale.*,
+           COALESCE(payment.gross_paid,0) gross_paid,
+           COALESCE(payment.payment_methods,'') payment_methods,
+           COALESCE(refund.refunded,0) refunded,
+           COALESCE(item.returned_value,0) returned_value,
+           COALESCE(item.retained_discount,0) retained_discount,
+           COALESCE(item.retained_quantity,0) retained_quantity,
+           COALESCE(item.product_names,'') product_names,
+           COALESCE(item.retained_product_names,'') retained_product_names,
+           COALESCE(delivery.delivered_at::date,sale.delivery_date) actual_delivery_date
+         FROM sales sale
+         LEFT JOIN LATERAL (
+           SELECT
+             sum(sale_payment.amount) gross_paid,
+             string_agg(
+               DISTINCT sale_payment.method::text,
+               ', ' ORDER BY sale_payment.method::text
+             ) payment_methods
+           FROM sale_payments sale_payment
+           WHERE sale_payment.sale_id=sale.id
+         ) payment ON true
+         LEFT JOIN LATERAL (
+           SELECT sum(sale_refund.amount) refunded
+           FROM sale_refunds sale_refund
+           WHERE sale_refund.sale_id=sale.id
+         ) refund ON true
+         LEFT JOIN LATERAL (
+           SELECT
+             string_agg(
+               product.name || ' × ' || sale_item.quantity::text,
+               ', ' ORDER BY product.name
+             ) product_names,
+             string_agg(
+               product.name || ' × ' ||
+                 GREATEST(sale_item.quantity-COALESCE(returned.quantity,0),0)::text,
+               ', ' ORDER BY product.name
+             ) FILTER (
+               WHERE sale_item.quantity-COALESCE(returned.quantity,0)>0
+             ) retained_product_names,
+             sum(COALESCE(returned.quantity,0)*sale_item.final_unit_price) returned_value,
+             sum(
+               GREATEST(sale_item.quantity-COALESCE(returned.quantity,0),0)
+               * sale_item.discount_amount
+             ) retained_discount,
+             sum(
+               GREATEST(sale_item.quantity-COALESCE(returned.quantity,0),0)
+             )::integer retained_quantity
+           FROM sale_items sale_item
+           JOIN products product ON product.id=sale_item.product_id
+           LEFT JOIN LATERAL (
+             SELECT sum(stock.quantity)::integer quantity
+             FROM stock_movements stock
+             WHERE stock.reference_id=sale_item.id
+               AND stock.type='RETURN'
+               AND stock.deleted_at IS NULL
+           ) returned ON true
+           WHERE sale_item.sale_id=sale.id
+         ) item ON true
+         LEFT JOIN LATERAL (
+           SELECT max(delivery_audit.created_at) delivered_at
+           FROM audit_logs delivery_audit
+           WHERE delivery_audit.entity_type='SALE'
+             AND delivery_audit.entity_id=sale.id
+             AND delivery_audit.action='DELIVERED'
+         ) delivery ON true
+         WHERE sale.customer_id=$1
+         ORDER BY sale.business_date DESC,sale.created_at DESC`,
+        [cid],
       ),
-    }));
+      pool.query(
+        `SELECT
+           reservation.*,
+           product.name product_name,
+           reservation.quantity*COALESCE(reservation.selling_price,0) reservation_total,
+           GREATEST(
+             reservation.quantity*COALESCE(reservation.selling_price,0)-reservation.deposit_paid,
+             0
+           ) remaining
+         FROM reservations reservation
+         JOIN products product ON product.id=reservation.product_id
+         WHERE reservation.customer_id=$1
+         ORDER BY reservation.created_at DESC`,
+        [cid],
+      ),
+      pool.query(
+        `SELECT audit.*,actor.name user_name
+         FROM audit_logs audit
+         LEFT JOIN users actor ON actor.id=audit.user_id
+         WHERE audit.entity_type='CUSTOMER'
+           AND audit.entity_id=$1
+           AND (audit.action LIKE '%_CHANGED' OR audit.action='UPDATE')
+         ORDER BY audit.created_at DESC`,
+        [cid],
+      ),
+    ]);
+    const purchases = sales.rows.map((sale) => {
+      const balancedSale = withSaleBalance(sale);
+      const fullyReturned = +sale.retained_quantity === 0;
+      return {
+        ...balancedSale,
+        paid: Math.min(balancedSale.paid, balancedSale.effectiveTotal),
+        discount: +sale.retained_discount,
+        status: fullyReturned
+          ? "RETURNED"
+          : sale.status === "PARTIALLY_RETURNED"
+            ? "PARTIALLY_RETURNED"
+            : sale.status === "CANCELLED"
+              ? "CANCELLED"
+            : balancedSale.paymentStatus,
+      };
+    });
+    const changes = auditChanges.rows.flatMap((change) => {
+      const storedChanges = change.details?.changes;
+      if (change.action === "UPDATE" && storedChanges)
+        return Object.entries(storedChanges).map(
+          ([field, values]: [string, any]) => ({
+            id: `${change.id}-${field}`,
+            type: `${field.toUpperCase()}_CHANGED`,
+            field_name: field.toUpperCase(),
+            old_value: values?.oldValue ?? null,
+            new_value: values?.newValue ?? null,
+            user_name: change.user_name,
+            occurred_at: change.created_at,
+          }),
+        );
+      return [
+        {
+          id: change.id,
+          type: change.action,
+          field_name: change.details?.fieldName || "—",
+          old_value: change.details?.oldValue ?? null,
+          new_value: change.details?.newValue ?? null,
+          user_name: change.user_name,
+          occurred_at: change.created_at,
+        },
+      ];
+    });
+    const lastPurchase = purchases.find(
+      (sale) => sale.status !== "RETURNED" && sale.status !== "CANCELLED",
+    );
+    const validPurchases = purchases.filter(
+      (sale) => sale.status !== "CANCELLED",
+    );
+    const activeReservations = reservations.rows.filter(
+      (reservation) => reservation.status === "ACTIVE",
+    );
+    const statistics = {
+      totalSpent: +validPurchases
+        .reduce((sum, sale) => sum + sale.paid, 0)
+        .toFixed(2),
+      totalDiscount: +validPurchases
+        .reduce((sum, sale) => sum + sale.discount, 0)
+        .toFixed(2),
+      outstandingDebt: +validPurchases
+        .reduce((sum, sale) => sum + sale.remaining, 0)
+        .toFixed(2),
+      activeReservationBalance: +activeReservations
+        .reduce((sum, reservation) => sum + +reservation.remaining, 0)
+        .toFixed(2),
+      lastPurchaseDate: lastPurchase?.business_date || null,
+      lastPurchasedItem: lastPurchase?.retained_product_names || null,
+    };
     res.json({
-      customer: c.rows[0],
-      sales: history,
-      totalSpent: history.reduce((sum, sale) => sum + sale.paid, 0),
+      customer: customer.rows[0],
+      purchases,
+      sales: purchases,
+      reservations: reservations.rows,
+      changes,
+      totalSpent: statistics.totalSpent,
+      statistics,
     });
   }),
 );
@@ -2541,15 +2861,9 @@ app.get(
     );
     const rows = r.rows
       .map((sale) => {
-        const balance = calculateSaleBalance(
-          +sale.total,
-          +sale.gross_paid,
-          +sale.refunded,
-          +sale.returned_value,
-        );
+        const balancedSale = withSaleBalance(sale);
         return {
-          ...sale,
-          ...balance,
+          ...balancedSale,
           delivery_view_status: ["IN_TRANSIT", "DELIVERED"].includes(
             sale.delivery_status,
           )
@@ -2623,16 +2937,10 @@ app.get(
     );
     const rows = r.rows
       .map((sale) => {
-        const balance = calculateSaleBalance(
-          +sale.total,
-          +sale.gross_paid,
-          +sale.refunded,
-          +sale.returned_value,
-        );
+        const balancedSale = withSaleBalance(sale);
         return {
-          ...sale,
-          ...balance,
-          payment_status: balance.paymentStatus,
+          ...balancedSale,
+          payment_status: balancedSale.paymentStatus,
         };
       })
       .filter((s) =>
@@ -2943,10 +3251,17 @@ app.put(
       const oldValues = Object.fromEntries(
         before.rows.map((row) => [row.key, row.value]),
       );
-      for (const [k, v] of Object.entries(x))
+      const entries = Object.entries(x);
+      if (entries.length)
         await c.query(
-          "INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-          [k, v],
+          `INSERT INTO settings(key,value)
+           SELECT input.key,input.value
+           FROM unnest($1::text[],$2::text[]) AS input(key,value)
+           ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`,
+          [
+            entries.map(([key]) => key),
+            entries.map(([, value]) => value),
+          ],
         );
       const changes = Object.fromEntries(
         Object.entries(x)
