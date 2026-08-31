@@ -29,4 +29,4 @@ CREATE INDEX audit_logs_entity_idx ON audit_logs(entity_type,entity_id,created_a
 CREATE TABLE settings (key text PRIMARY KEY, value text NOT NULL);
 INSERT INTO categories(name) VALUES ('Sofas'),('Armchairs'),('Beds'),('Tables'),('Chairs'),('Wardrobes'),('Cabinets'),('Mattresses'),('Other');
 INSERT INTO settings(key,value) VALUES ('Shop Name','Furniture Shop'),('currency','GEL');
-INSERT INTO users(name,username,password_hash,role) VALUES ('Administrator','admin','$2a$12$ylRBMvCiQMO/2snBM.v3POkJISRImCl0QOVihWCHNJ9YnHUEHMLQK','ADMIN');
+INSERT INTO users(name,username,password_hash,role) VALUES ('Administrator','maiko_root','$2a$12$X8JwEHws3Y.0dDZlstWKueQSKNpHBr2Z9SfTNVolP3ly6QvaQsXpS','ADMIN');

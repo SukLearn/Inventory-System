@@ -6,7 +6,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-furniture_inventory}
       POSTGRES_USER: ${POSTGRES_USER:-inventory}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       TZ: ${APP_TIMEZONE:-Asia/Tbilisi}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
@@ -27,7 +27,7 @@ services:
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB:-furniture_inventory}
       PGUSER: ${POSTGRES_USER:-inventory}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       JWT_SECRET: ${JWT_SECRET:-development-only-change-me}
       CORS_ORIGIN: http://localhost:${FRONTEND_PORT:-3000}
       UPLOAD_DIR: /app/uploads
@@ -58,7 +58,7 @@ services:
       PGPORT: 5432
       PGDATABASE: ${POSTGRES_DB:-furniture_inventory}
       PGUSER: ${POSTGRES_USER:-inventory}
-      PGPASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       TZ: ${APP_TIMEZONE:-Asia/Tbilisi}
       BACKUP_ROOT: /backups
       UPLOAD_ROOT: /uploads

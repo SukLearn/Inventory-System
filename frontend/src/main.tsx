@@ -19,6 +19,7 @@ import "@fontsource/open-sans/latin-400.css";
 import "@fontsource/open-sans/latin-500.css";
 import "@fontsource/open-sans/latin-600.css";
 import "@fontsource/open-sans/latin-700.css";
+import logoUrl from "../logo/root_servere.png";
 import "./style.css";
 import "./changes.css";
 import {
@@ -50,7 +51,10 @@ class ErrorBoundary extends React.Component<
     if (this.state.failed)
       return (
         <main className="login">
-          <h1>Furniture Shop</h1>
+          <h1 className="brand">
+            <img className="brand-logo" src={logoUrl} alt="" />
+            <span>Inventory</span>
+          </h1>
           <p className="error">The page could not be displayed.</p>
           <button onClick={() => window.location.reload()}>Reload</button>
         </main>
@@ -277,7 +281,7 @@ const readShopName = () => localStorage.getItem("shopName") || "Furniture Shop";
 const applyTheme = (theme = localStorage.getItem("theme") || "White") =>
   (document.documentElement.dataset.theme = theme.toLowerCase());
 applyTheme();
-document.title = readShopName();
+document.title = "Inventory";
 function StatusValue({ value }: { value: any }) {
   const v = String(value || "");
   const color =
@@ -302,6 +306,14 @@ function ShopTitle() {
     return () => window.removeEventListener(preferenceEvent, sync);
   }, []);
   return <span data-no-translate>{name}</span>;
+}
+function Brand() {
+  return (
+    <span className="brand" data-no-translate>
+      <img className="brand-logo" src={logoUrl} alt="" />
+      <ShopTitle />
+    </span>
+  );
 }
 function CategoryManagement() {
   const [categories, setCategories] = useState<O[]>([]);
@@ -428,7 +440,7 @@ function SettingsWithPreferences({ admin }: { admin: boolean }) {
     localStorage.setItem("theme", theme);
     saveLanguage(language);
     applyTheme(theme);
-    document.title = name;
+    document.title = "Inventory";
     window.dispatchEvent(new Event(preferenceEvent));
     setMessage("Settings saved");
   };
@@ -1902,7 +1914,7 @@ function Login({ done }: { done: (u: O) => void }) {
   return (
     <main className="login">
       <h1>
-        <ShopTitle />
+        <Brand />
       </h1>
       <form
         onSubmit={async (x) => {
@@ -3800,7 +3812,7 @@ function Shell({ u, out }: { u: O; out: () => void }) {
     <div className="shell">
       <aside>
         <h1>
-          <ShopTitle />
+          <Brand />
         </h1>
         <button
           type="button"

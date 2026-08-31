@@ -158,6 +158,24 @@ aside {
 aside h1 {
   letter-spacing: -0.02em;
 }
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.brand-logo {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  object-fit: contain;
+}
+.brand > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 aside a,
 aside button,
 .nav-dropdown-trigger {
@@ -445,6 +463,9 @@ form label > textarea {
   font-size: 1.55rem;
   line-height: 1.25;
   text-align: center;
+}
+.login .brand {
+  justify-content: center;
 }
 .login form {
   gap: 10px;
@@ -984,6 +1005,10 @@ h3 {
     font-size: 1.05rem;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  aside .brand-logo {
+    width: 30px;
+    height: 30px;
   }
   .mobile-nav-toggle {
     display: inline-flex;

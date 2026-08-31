@@ -7,7 +7,7 @@
 3. Run `docker compose up -d --build` once. Containers use `restart: unless-stopped`, so they return after Docker Desktop starts.
 4. Open `http://localhost:3000` (or `http://<laptop-ip>:3000` on the shop LAN). Keep Windows Firewall's private-network prompt enabled.
 
-Initial development administrator: `admin` / `Admin123!` — change it immediately through Settings.
+Initial administrator: `maiko_root` / `AmciA2d@345*Sc.` — change it immediately through Settings.
 
 ## Data and backups
 
