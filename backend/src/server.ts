@@ -50,6 +50,27 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 app.use("/uploads", express.static(uploadDir));
+const disabledInventoryOnlyApiPrefixes = [
+  "/api/customers",
+  "/api/contacts",
+  "/api/sales",
+  "/api/reservations",
+  "/api/payments",
+  "/api/deliveries",
+  "/api/reports",
+];
+app.use((req, res, next) => {
+  const disabled = disabledInventoryOnlyApiPrefixes.some(
+    (prefix) => req.path === prefix || req.path.startsWith(prefix + "/"),
+  );
+  if (!disabled) return next();
+  res.status(404).json({
+    error: {
+      code: "FEATURE_NOT_AVAILABLE",
+      message: "This application is configured for inventory management only.",
+    },
+  });
+});
 const asyncRoute =
   (fn: (r: Request, s: Response, n: NextFunction) => Promise<unknown>) =>
   (r: Request, s: Response, n: NextFunction) =>
@@ -166,6 +187,10 @@ const positiveInteger = numericValue
   .refine(Number.isInteger, "Enter a whole number")
   .refine((value) => value > 0, "Enter a number greater than zero");
 const qty = positiveInteger;
+const invoiceCodeSchema = z
+  .string()
+  .regex(/^(?:0|[1-9]\d*)$/, "Invoice code must contain digits only")
+  .max(100);
 const withSaleBalance = <T extends Record<string, any>>(sale: T) => ({
   ...sale,
   ...calculateSaleBalance(
@@ -183,15 +208,19 @@ const productSchema = z.object({
   categoryId: id,
   supplierId: id,
   description: z.string().optional().nullable(),
-  purchasePrice: money.default(0),
-  sellingPrice: money.default(0),
-  width: nonnegativeNumber.optional().nullable(),
-  height: nonnegativeNumber.optional().nullable(),
-  depth: nonnegativeNumber.optional().nullable(),
-  material: z.string().optional().nullable(),
-  color: z.string().optional().nullable(),
   isActive: z.boolean().optional(),
 });
+const inventoryProductResponse = (product: Record<string, any>) => {
+  const visibleProduct = { ...product };
+  delete visibleProduct.purchase_price;
+  delete visibleProduct.selling_price;
+  delete visibleProduct.width;
+  delete visibleProduct.height;
+  delete visibleProduct.depth;
+  delete visibleProduct.material;
+  delete visibleProduct.color;
+  return visibleProduct;
+};
 const contactSchema = z.object({
   name: z.string().min(1),
   phone: z.string().optional().nullable(),
@@ -397,7 +426,170 @@ function contactRoutes(name: string, table: string, adminWrite = false) {
   );
 }
 contactRoutes("customers", "customers");
-contactRoutes("suppliers", "suppliers", true);
+const supplierSchema = z.object({
+  name: z.string().trim().min(1),
+  notes: z.string().optional().nullable(),
+});
+app.get(
+  "/api/suppliers",
+  auth(),
+  asyncRoute(async (_req, res) => {
+    const result = await pool.query(
+      `WITH available AS (
+         SELECT product.supplier_id,
+           COALESCE(sum(product.current_quantity),0)::integer available_products
+         FROM products product
+         WHERE product.is_active AND product.supplier_id IS NOT NULL
+         GROUP BY product.supplier_id
+       ), registered AS (
+         SELECT history.supplier_id,count(*)::integer unique_products_registered
+         FROM (
+           SELECT product.supplier_id,product.id product_id
+           FROM products product
+           WHERE product.supplier_id IS NOT NULL
+           UNION
+           SELECT movement.supplier_id,movement.product_id
+           FROM stock_movements movement
+           WHERE movement.supplier_id IS NOT NULL
+         ) history
+         GROUP BY history.supplier_id
+       )
+       SELECT supplier.id,supplier.name,supplier.notes,supplier.created_at,supplier.updated_at,
+         COALESCE(available.available_products,0) available_products,
+         COALESCE(registered.unique_products_registered,0) unique_products_registered
+       FROM suppliers supplier
+       LEFT JOIN available ON available.supplier_id=supplier.id
+       LEFT JOIN registered ON registered.supplier_id=supplier.id
+       ORDER BY supplier.name`,
+    );
+    res.json(result.rows);
+  }),
+);
+app.post(
+  "/api/suppliers",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const values = supplierSchema.parse(req.body);
+    const created = await tx(async (client) => {
+      const result = await client.query(
+        "INSERT INTO suppliers(name,notes) VALUES($1,$2) RETURNING id,name,notes,created_at,updated_at",
+        [values.name, values.notes || null],
+      );
+      await audit(client, req.user!, "CREATE", "SUPPLIER", result.rows[0].id, {
+        name: result.rows[0].name,
+        notes: result.rows[0].notes,
+      });
+      return result.rows[0];
+    });
+    res.status(201).json(created);
+  }),
+);
+app.patch(
+  "/api/suppliers/:id",
+  auth(["ADMIN"]),
+  asyncRoute(async (req, res) => {
+    const values = supplierSchema.partial().parse(req.body);
+    if (!Object.keys(values).length)
+      throw error("VALIDATION", "No changes supplied");
+    const supplierId = id.parse(req.params.id);
+    const updated = await tx(async (client) => {
+      const before = await client.query(
+        "SELECT id,name,notes FROM suppliers WHERE id=$1 FOR UPDATE",
+        [supplierId],
+      );
+      if (!before.rowCount)
+        throw error("NOT_FOUND", "Supplier not found", 404);
+      const result = await client.query(
+        "UPDATE suppliers SET name=COALESCE($1,name),notes=$2,updated_at=now() WHERE id=$3 RETURNING id,name,notes,created_at,updated_at",
+        [values.name, values.notes === undefined ? before.rows[0].notes : values.notes || null, supplierId],
+      );
+      const changes = changedValues(before.rows[0], result.rows[0], [
+        "name",
+        "notes",
+      ]);
+      if (Object.keys(changes).length)
+        await audit(client, req.user!, "UPDATE", "SUPPLIER", supplierId, {
+          name: result.rows[0].name,
+          changes,
+        });
+      return result.rows[0];
+    });
+    res.json(updated);
+  }),
+);
+app.get(
+  "/api/suppliers/:id/inventory",
+  auth(),
+  asyncRoute(async (req, res) => {
+    const supplierId = id.parse(req.params.id);
+    const supplier = await pool.query(
+      "SELECT id,name,notes FROM suppliers WHERE id=$1",
+      [supplierId],
+    );
+    if (!supplier.rowCount)
+      throw error("NOT_FOUND", "Supplier not found", 404);
+    const [products, movements] = await Promise.all([
+      pool.query(
+        `WITH supplier_products AS (
+           SELECT product.id
+           FROM products product
+           WHERE product.supplier_id=$1
+           UNION
+           SELECT movement.product_id
+           FROM stock_movements movement
+           WHERE movement.supplier_id=$1
+         )
+         SELECT product.id,product.name,
+           product.current_quantity quantity,
+           COALESCE(json_object_agg(warehouse.slug,COALESCE(stock.quantity,0))
+             FILTER (WHERE warehouse.id IS NOT NULL),json_build_object()) location_quantities
+         FROM supplier_products related
+         JOIN products product ON product.id=related.id
+         CROSS JOIN warehouses warehouse
+         LEFT JOIN product_location_stock stock
+           ON stock.product_id=product.id AND stock.warehouse_id=warehouse.id
+         GROUP BY product.id
+         ORDER BY product.name`,
+        [supplierId],
+      ),
+      pool.query(
+        `WITH supplier_products AS (
+           SELECT product.id
+           FROM products product
+           WHERE product.supplier_id=$1
+           UNION
+           SELECT movement.product_id
+           FROM stock_movements movement
+           WHERE movement.supplier_id=$1
+         )
+         SELECT movement.id,movement.product_id,movement.type,movement.quantity,
+           movement.business_date,movement.invoice_code,movement.created_at,movement.notes,
+           movement.deleted_at,product.name product_name,
+           actor.name employee_name,
+           CASE WHEN destination.name IS NULL THEN warehouse.name
+             ELSE warehouse.name || ' → ' || destination.name END warehouse_name,
+           CASE
+             WHEN movement.type='REVERSED' THEN NULL
+             WHEN movement.deleted_at IS NOT NULL THEN 'REVERSED'
+             ELSE 'ACTIVE'
+           END status
+         FROM stock_movements movement
+         JOIN supplier_products related ON related.id=movement.product_id
+         JOIN products product ON product.id=movement.product_id
+         JOIN users actor ON actor.id=movement.user_id
+         LEFT JOIN warehouses warehouse ON warehouse.id=movement.warehouse_id
+         LEFT JOIN warehouses destination
+           ON destination.id=movement.destination_warehouse_id
+         WHERE movement.type IN ('IMPORT','SUPPLIER_RETURN','SOLD','CORRECTION','TRANSPORT','REVERSED')
+         ORDER BY COALESCE(movement.business_date,movement.created_at::date) DESC,
+           movement.created_at DESC
+         LIMIT 500`,
+        [supplierId],
+      ),
+    ]);
+    res.json({ supplier: supplier.rows[0], products: products.rows, actions: movements.rows });
+  }),
+);
 app.get("/api/contacts", auth(), listResource("contacts"));
 app.post(
   "/api/contacts",
@@ -421,6 +613,37 @@ app.post(
       return r.rows[0];
     });
     res.status(201).json(created);
+  }),
+);
+
+app.get(
+  "/api/warehouses",
+  auth(),
+  asyncRoute(async (_req, res) => {
+    const result = await pool.query(
+      "SELECT id,name,slug,kind FROM warehouses ORDER BY CASE kind WHEN 'SHOWROOM' THEN 0 ELSE 1 END,name",
+    );
+    res.json(result.rows);
+  }),
+);
+
+app.get(
+  "/api/invoices",
+  auth(),
+  asyncRoute(async (_req, res) => {
+    const result = await pool.query(
+      `SELECT sm.invoice_code code,
+         count(DISTINCT sm.product_id)::integer product_count,
+         COALESCE(sum(sm.quantity),0)::integer imported_quantity,
+         max(COALESCE(sm.business_date,sm.created_at::date)) last_import_date
+       FROM stock_movements sm
+       WHERE sm.type='IMPORT'
+         AND sm.deleted_at IS NULL
+         AND sm.invoice_code IS NOT NULL
+       GROUP BY sm.invoice_code
+       ORDER BY sm.invoice_code`,
+    );
+    res.json(result.rows);
   }),
 );
 
@@ -540,6 +763,8 @@ app.get(
       out = req.query.out === "true";
     const where: string[] = [];
     const p: any[] = [];
+    let warehouseJoin = "";
+    let warehouseQuantity = "NULL::integer warehouse_quantity";
     if (q) {
       p.push(`%${q}%`);
       where.push(`p.name ILIKE $${p.length}`);
@@ -556,23 +781,65 @@ app.get(
       p.push(id.parse(String(req.query.supplierId)));
       where.push(`p.supplier_id=$${p.length}`);
     }
-    if (req.query.minPrice !== undefined && req.query.minPrice !== "") {
-      p.push(money.parse(req.query.minPrice));
-      where.push(`p.selling_price>=$${p.length}`);
+    if (req.query.warehouseId) {
+      p.push(id.parse(String(req.query.warehouseId)));
+      const warehousePlaceholder = `$${p.length}`;
+      warehouseJoin = `LEFT JOIN product_location_stock filtered_stock
+        ON filtered_stock.product_id=p.id
+       AND filtered_stock.warehouse_id=${warehousePlaceholder}`;
+      warehouseQuantity =
+        "COALESCE(filtered_stock.quantity,0)::integer warehouse_quantity";
+      where.push("COALESCE(filtered_stock.quantity,0)>0");
     }
-    if (req.query.maxPrice !== undefined && req.query.maxPrice !== "") {
-      p.push(money.parse(req.query.maxPrice));
-      where.push(`p.selling_price<=$${p.length}`);
+    if (req.query.invoiceCode) {
+      const invoiceCode = invoiceCodeSchema.parse(
+        String(req.query.invoiceCode),
+      );
+      p.push(invoiceCode);
+      where.push(
+        `EXISTS(
+           SELECT 1
+           FROM stock_movements invoice_import
+           WHERE invoice_import.product_id=p.id
+             AND invoice_import.type='IMPORT'
+             AND invoice_import.deleted_at IS NULL
+             AND invoice_import.invoice_code=$${p.length}
+         )`,
+      );
     }
     if (out) where.push("p.current_quantity=0");
     const r = await pool.query(
-      `SELECT p.*,c.name category_name,s.name supplier_name,
+      `SELECT
+         p.id,p.name,p.category_id,p.supplier_id,p.description,
+         p.current_quantity,p.reserved_quantity,
+         ${warehouseQuantity},
+         p.is_active,p.created_at,p.updated_at,
+         c.name category_name,s.name supplier_name,
+         ARRAY(
+           SELECT DISTINCT invoice_import.invoice_code
+           FROM stock_movements invoice_import
+           WHERE invoice_import.product_id=p.id
+             AND invoice_import.type='IMPORT'
+             AND invoice_import.deleted_at IS NULL
+             AND invoice_import.invoice_code IS NOT NULL
+           ORDER BY invoice_import.invoice_code
+         ) invoice_codes,
+         ARRAY(
+           SELECT warehouse.name
+           FROM product_location_stock location_stock
+           JOIN warehouses warehouse ON warehouse.id=location_stock.warehouse_id
+           WHERE location_stock.product_id=p.id
+             AND location_stock.quantity>0
+           ORDER BY CASE warehouse.kind WHEN 'SHOWROOM' THEN 0 ELSE 1 END,
+             warehouse.name
+         ) warehouse_names,
          (p.current_quantity-p.reserved_quantity) available_quantity,
          (EXISTS(SELECT 1 FROM sale_items WHERE product_id=p.id)
            OR EXISTS(SELECT 1 FROM stock_movements WHERE product_id=p.id)
            OR EXISTS(SELECT 1 FROM reservations WHERE product_id=p.id)) has_history,
          (SELECT storage_path FROM product_images i WHERE i.product_id=p.id ORDER BY i.is_primary DESC,i.created_at LIMIT 1) primary_image
        FROM products p
+       ${warehouseJoin}
        LEFT JOIN categories c ON c.id=p.category_id
        LEFT JOIN suppliers s ON s.id=p.supplier_id
        ${where.length ? "WHERE " + where.join(" AND ") : ""}
@@ -587,15 +854,26 @@ app.get(
   auth(),
   asyncRoute(async (req, res) => {
     const r = await pool.query(
-      `SELECT p.*,
+      `SELECT
+         p.id,p.name,p.category_id,p.supplier_id,p.description,
+         p.current_quantity,p.reserved_quantity,
+         p.is_active,p.created_at,p.updated_at,
          (p.current_quantity-p.reserved_quantity) available_quantity,
          (EXISTS(SELECT 1 FROM sale_items WHERE product_id=p.id)
            OR EXISTS(SELECT 1 FROM stock_movements WHERE product_id=p.id)
            OR EXISTS(SELECT 1 FROM reservations WHERE product_id=p.id)) has_history,
          c.name category_name,
          s.name supplier_name,
-         (SELECT max(COALESCE(sm.business_date,sm.created_at::date)) FROM stock_movements sm WHERE sm.product_id=p.id AND sm.type='IMPORT' AND sm.deleted_at IS NULL) last_import_date,
-         (SELECT max(sa.business_date) FROM sale_items si JOIN sales sa ON sa.id=si.sale_id WHERE si.product_id=p.id) last_sale_date
+         ARRAY(
+           SELECT DISTINCT invoice_import.invoice_code
+           FROM stock_movements invoice_import
+           WHERE invoice_import.product_id=p.id
+             AND invoice_import.type='IMPORT'
+             AND invoice_import.deleted_at IS NULL
+             AND invoice_import.invoice_code IS NOT NULL
+           ORDER BY invoice_import.invoice_code
+         ) invoice_codes,
+         (SELECT max(COALESCE(sm.business_date,sm.created_at::date)) FROM stock_movements sm WHERE sm.product_id=p.id AND sm.type='IMPORT' AND sm.deleted_at IS NULL) last_import_date
        FROM products p
        LEFT JOIN categories c ON c.id=p.category_id
        LEFT JOIN suppliers s ON s.id=p.supplier_id
@@ -610,41 +888,52 @@ app.get(
     res.json({ ...r.rows[0], images: images.rows });
   }),
 );
+type NewProduct = Pick<
+  z.infer<typeof productSchema>,
+  "name" | "categoryId" | "supplierId" | "description"
+>;
+async function createProductRecord(
+  c: PoolClient,
+  user: User,
+  values: NewProduct,
+) {
+  const result = await c.query(
+    "INSERT INTO products(name,category_id,supplier_id,description) VALUES($1,$2,$3,$4) RETURNING *",
+    [
+      values.name,
+      values.categoryId,
+      values.supplierId,
+      values.description || null,
+    ],
+  );
+  const product = result.rows[0];
+  await c.query(
+    "INSERT INTO product_location_stock(product_id,warehouse_id,quantity) SELECT $1,id,0 FROM warehouses ON CONFLICT DO NOTHING",
+    [product.id],
+  );
+  await productEvent(
+    c,
+    user,
+    product.id,
+    "PRODUCT_CREATED",
+    undefined,
+    undefined,
+    product.name,
+  );
+  await audit(c, user, "CREATE", "PRODUCT", product.id, {
+    name: product.name,
+  });
+  return product;
+}
 app.post(
   "/api/products",
   auth(["ADMIN"]),
   asyncRoute(async (req, res) => {
     const x = productSchema.parse(req.body);
     const product = await tx(async (c) => {
-      const r = await c.query(
-        "INSERT INTO products(name,category_id,supplier_id,description,purchase_price,selling_price,width,height,depth,material,color) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *",
-        [
-          x.name,
-          x.categoryId,
-          x.supplierId,
-          x.description,
-          x.purchasePrice,
-          x.sellingPrice,
-          x.width,
-          x.height,
-          x.depth,
-          x.material,
-          x.color,
-        ],
-      );
-      await productEvent(
-        c,
-        req.user!,
-        r.rows[0].id,
-        "PRODUCT_CREATED",
-        undefined,
-        undefined,
-        r.rows[0].name,
-      );
-      await audit(c, req.user!, "CREATE", "PRODUCT", r.rows[0].id);
-      return r.rows[0];
+      return createProductRecord(c, req.user!, x);
     });
-    res.status(201).json(product);
+    res.status(201).json(inventoryProductResponse(product));
   }),
 );
 app.patch(
@@ -655,8 +944,6 @@ app.patch(
       columnByField: Record<string, string> = {
         categoryId: "category_id",
         supplierId: "supplier_id",
-        purchasePrice: "purchase_price",
-        sellingPrice: "selling_price",
         isActive: "is_active",
       },
       activityByField: Record<string, [string, string]> = {
@@ -664,13 +951,6 @@ app.patch(
         categoryId: ["CATEGORY_CHANGED", "CATEGORY"],
         supplierId: ["SUPPLIER_CHANGED", "SUPPLIER"],
         description: ["NOTES_CHANGED", "NOTES"],
-        purchasePrice: ["PURCHASE_PRICE_CHANGED", "PURCHASE PRICE"],
-        sellingPrice: ["SELLING_PRICE_CHANGED", "SELLING PRICE"],
-        width: ["WIDTH_CHANGED", "WIDTH"],
-        height: ["HEIGHT_CHANGED", "HEIGHT"],
-        depth: ["DEPTH_CHANGED", "DEPTH"],
-        material: ["MATERIAL_CHANGED", "MATERIAL"],
-        color: ["COLOR_CHANGED", "COLOR"],
         isActive: ["STATUS_CHANGED", "STATUS"],
       };
     const keys = Object.keys(x);
@@ -697,13 +977,7 @@ app.patch(
           "ARCHIVED_PRODUCT",
           "Products with history must remain archived",
         );
-      const numericFields = new Set([
-        "purchasePrice",
-        "sellingPrice",
-        "width",
-        "height",
-        "depth",
-      ]);
+      const numericFields = new Set<string>();
       const comparable = (field: string, value: any) =>
         numericFields.has(field) && value != null
           ? Number(value)
@@ -760,7 +1034,7 @@ app.patch(
       });
       return after;
     });
-    res.json(product);
+    res.json(inventoryProductResponse(product));
   }),
 );
 app.delete(
@@ -946,6 +1220,8 @@ async function move(
   purchasePrice?: number,
   referenceId?: string,
   businessDate?: string,
+  warehouseId?: string,
+  invoiceCode?: string,
 ) {
   const r = await c.query("SELECT * FROM products WHERE id=$1 FOR UPDATE", [
     productId,
@@ -965,16 +1241,39 @@ async function move(
           ? -quantity
           : 0),
     effectiveSupplierId =
-      supplierId ?? (type === "IMPORT" ? p.supplier_id : undefined),
+      supplierId ??
+      (["IMPORT", "SUPPLIER_RETURN"].includes(type)
+        ? p.supplier_id
+        : undefined),
     movementPurchasePrice =
       purchasePrice ??
       (type === "LOST" || type === "DESTROYED" ? +p.purchase_price : undefined);
-  if (type === "IMPORT" && !effectiveSupplierId)
+  const selectedWarehouse = warehouseId
+    ? await c.query("SELECT id,name FROM warehouses WHERE id=$1", [warehouseId])
+    : await c.query("SELECT id,name FROM warehouses WHERE slug='showroom'");
+  if (!selectedWarehouse.rowCount)
+    throw error("NOT_FOUND", "Inventory location not found", 404);
+  const effectiveWarehouseId = selectedWarehouse.rows[0].id;
+  await c.query(
+    "INSERT INTO product_location_stock(product_id,warehouse_id,quantity) VALUES($1,$2,0) ON CONFLICT DO NOTHING",
+    [productId, effectiveWarehouseId],
+  );
+  const locationStock = await c.query(
+    "SELECT quantity FROM product_location_stock WHERE product_id=$1 AND warehouse_id=$2 FOR UPDATE",
+    [productId, effectiveWarehouseId],
+  );
+  const newLocationQuantity = +locationStock.rows[0].quantity + (reserve ? 0 : quantity);
+  if (["IMPORT", "SUPPLIER_RETURN"].includes(type) && !effectiveSupplierId)
     throw error(
       "PRODUCT_SUPPLIER_REQUIRED",
-      "Assign a supplier to the product before importing stock",
+      "Assign a supplier to the product before recording this stock movement",
     );
-  if (newCurrent < 0 || newReserved < 0 || newReserved > newCurrent)
+  if (
+    newCurrent < 0 ||
+    newReserved < 0 ||
+    newReserved > newCurrent ||
+    newLocationQuantity < 0
+  )
     throw error(
       "INSUFFICIENT_STOCK",
       `Only ${p.current_quantity - p.reserved_quantity} units are available.`,
@@ -983,8 +1282,12 @@ async function move(
     "UPDATE products SET current_quantity=$1,reserved_quantity=$2,purchase_price=COALESCE($3,purchase_price),supplier_id=COALESCE($4,supplier_id),updated_at=now() WHERE id=$5",
     [newCurrent, newReserved, movementPurchasePrice, effectiveSupplierId, productId],
   );
+  await c.query(
+    "UPDATE product_location_stock SET quantity=$1,updated_at=now() WHERE product_id=$2 AND warehouse_id=$3",
+    [newLocationQuantity, productId, effectiveWarehouseId],
+  );
   const movement = await c.query(
-    "INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,supplier_id,purchase_price,business_date,notes) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *",
+    "INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,supplier_id,purchase_price,business_date,notes,warehouse_id,invoice_code) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *",
     [
       productId,
       type,
@@ -995,6 +1298,8 @@ async function move(
       movementPurchasePrice ?? null,
       businessDate || null,
       notes || null,
+      effectiveWarehouseId,
+      invoiceCode || null,
     ],
   );
   return { product: p, movement: movement.rows[0] };
@@ -1206,27 +1511,53 @@ app.post(
   asyncRoute(async (req, res) => {
     const x = z
       .object({
-        productId: id,
+        productId: id.nullable().optional(),
+        newProduct: productSchema
+          .pick({ name: true, categoryId: true, supplierId: true })
+          .optional(),
+        warehouseId: id,
         quantity: qty,
-        purchasePrice: money,
         importDate: dateOnly,
+        invoiceCode: invoiceCodeSchema,
         notes: z.string().optional(),
       })
       .parse(req.body);
+    if (Boolean(x.productId) === Boolean(x.newProduct))
+      throw error(
+        "VALIDATION",
+        "Choose an existing product or enter one new product",
+      );
+    if (x.newProduct && req.user!.role !== "ADMIN")
+      throw error(
+        "FORBIDDEN",
+        "Only administrators can create products",
+        403,
+      );
     await tx(async (c) => {
+      const productId = x.productId ||
+        (await createProductRecord(c, req.user!, x.newProduct!)).id;
       await move(
         c,
         req.user!,
-        x.productId,
+        productId,
         "IMPORT",
         x.quantity,
         x.notes,
         undefined,
-        x.purchasePrice,
+        undefined,
         undefined,
         x.importDate,
+        x.warehouseId,
+        x.invoiceCode,
       );
-      await audit(c, req.user!, "IMPORT", "PRODUCT", x.productId, x);
+      await audit(c, req.user!, "IMPORT", "PRODUCT", productId, {
+        productId,
+        warehouseId: x.warehouseId,
+        quantity: x.quantity,
+        importDate: x.importDate,
+        invoiceCode: x.invoiceCode,
+        notes: x.notes || null,
+      });
     });
     res.status(201).json({ ok: true });
   }),
@@ -1238,13 +1569,15 @@ app.post(
     const x = z
       .object({
         productId: id,
+        warehouseId: id,
+        destinationWarehouseId: id.nullable().optional(),
         quantity: qty,
-        type: z.enum(["DESTROYED", "LOST", "RETURN", "CORRECTION"]),
+        type: z.enum(["SUPPLIER_RETURN", "SOLD", "CORRECTION", "TRANSPORT"]),
         correctionDirection: z
           .enum(["INCREASE", "DECREASE"])
           .nullable()
           .optional(),
-        saleNumber: positiveInteger.optional(),
+        businessDate: dateOnly,
         notes: z.string().optional(),
       })
       .parse(req.body);
@@ -1253,53 +1586,101 @@ app.post(
         "VALIDATION",
         "Correction direction is required for a correction",
       );
-    if (["DESTROYED", "LOST"].includes(x.type) && !x.notes)
-      throw error("VALIDATION", "A note is required for this adjustment");
-    if (x.type === "RETURN" && !x.saleNumber)
-      throw error("VALIDATION", "Sale ID is required for a return");
+    if (x.type === "TRANSPORT" && !x.destinationWarehouseId)
+      throw error(
+        "VALIDATION",
+        "Destination warehouse is required for transport",
+      );
+    if (
+      x.type === "TRANSPORT" &&
+      x.destinationWarehouseId === x.warehouseId
+    )
+      throw error(
+        "VALIDATION",
+        "Source and destination warehouses must be different",
+      );
     const result = await tx(async (c) => {
-      if (x.type === "RETURN") {
-        const sale = await c.query(
-          "SELECT id FROM sales WHERE sale_number=$1",
-          [x.saleNumber],
+      if (x.type === "TRANSPORT") {
+        const product = await c.query(
+          "SELECT id,name FROM products WHERE id=$1 FOR UPDATE",
+          [x.productId],
         );
-        if (!sale.rowCount) throw error("NOT_FOUND", "Sale ID not found", 404);
-        const candidates = await c.query(
-          "SELECT si.id,si.quantity-COALESCE((SELECT sum(sm.quantity) FROM stock_movements sm WHERE sm.reference_id=si.id AND sm.type='RETURN' AND sm.deleted_at IS NULL),0) available FROM sale_items si WHERE si.sale_id=$1 AND si.product_id=$2 ORDER BY si.id",
-          [sale.rows[0].id, x.productId],
+        if (!product.rowCount)
+          throw error("NOT_FOUND", "Product not found", 404);
+        const locations = await c.query(
+          "SELECT id,name FROM warehouses WHERE id IN ($1,$2)",
+          [x.warehouseId, x.destinationWarehouseId],
         );
-        if (!candidates.rowCount)
+        if (locations.rowCount !== 2)
+          throw error("NOT_FOUND", "Inventory location not found", 404);
+        const locationNames = new Map(
+          locations.rows.map((location) => [location.id, location.name]),
+        );
+        await c.query(
+          `INSERT INTO product_location_stock(product_id,warehouse_id,quantity)
+           VALUES($1,$2,0),($1,$3,0)
+           ON CONFLICT DO NOTHING`,
+          [x.productId, x.warehouseId, x.destinationWarehouseId],
+        );
+        const stock = await c.query(
+          `SELECT warehouse_id,quantity
+           FROM product_location_stock
+           WHERE product_id=$1 AND warehouse_id IN ($2,$3)
+           ORDER BY warehouse_id
+           FOR UPDATE`,
+          [x.productId, x.warehouseId, x.destinationWarehouseId],
+        );
+        const source = stock.rows.find(
+          (location) => location.warehouse_id === x.warehouseId,
+        );
+        if (!source || +source.quantity < x.quantity)
           throw error(
-            "RETURN_NOT_SOLD",
-            "This product was not sold in that sale",
+            "INSUFFICIENT_STOCK",
+            `Only ${source?.quantity || 0} units are available in ${locationNames.get(x.warehouseId)}.`,
           );
-        let remaining = x.quantity;
-        const returnItems: SaleReturnItem[] = [];
-        for (const candidate of candidates.rows) {
-          if (remaining <= 0) break;
-          const quantity = Math.min(remaining, +candidate.available);
-          if (quantity > 0) {
-            returnItems.push({ saleItemId: candidate.id, quantity });
-            remaining -= quantity;
-          }
-        }
-        if (remaining > 0)
-          throw error(
-            "RETURN_LIMIT",
-            "Returned quantity exceeds the quantity sold",
-          );
-        const reason = x.notes || "Customer return";
-        const processed = await processSaleReturn(
-          c,
-          req.user!,
-          sale.rows[0].id,
-          returnItems,
-          reason,
+        await c.query(
+          `UPDATE product_location_stock
+           SET quantity=quantity + CASE
+             WHEN warehouse_id=$2 THEN $4::integer
+             ELSE $5::integer
+           END,
+             updated_at=now()
+           WHERE product_id=$1 AND warehouse_id IN ($2,$3)`,
+          [
+            x.productId,
+            x.warehouseId,
+            x.destinationWarehouseId,
+            -x.quantity,
+            x.quantity,
+          ],
         );
-        return {
-          ok: true,
-          ...processed,
-        };
+        const movement = await c.query(
+          `INSERT INTO stock_movements(
+             product_id,type,quantity,user_id,business_date,notes,
+             warehouse_id,destination_warehouse_id
+           ) VALUES($1,'TRANSPORT',$2,$3,$4,$5,$6,$7)
+           RETURNING id`,
+          [
+            x.productId,
+            x.quantity,
+            req.user!.id,
+            x.businessDate,
+            x.notes || null,
+            x.warehouseId,
+            x.destinationWarehouseId,
+          ],
+        );
+        await audit(c, req.user!, "TRANSPORT", "PRODUCT", x.productId, {
+          movementId: movement.rows[0].id,
+          quantity: x.quantity,
+          businessDate: x.businessDate,
+          fromWarehouseId: x.warehouseId,
+          fromWarehouse: locationNames.get(x.warehouseId),
+          toWarehouseId: x.destinationWarehouseId,
+          toWarehouse: locationNames.get(x.destinationWarehouseId!),
+          notes: x.notes || null,
+        });
+        return { ok: true };
       }
       const signed =
         x.type === "CORRECTION"
@@ -1307,7 +1688,19 @@ app.post(
             ? -x.quantity
             : x.quantity
           : -x.quantity;
-      await move(c, req.user!, x.productId, x.type, signed, x.notes);
+      await move(
+        c,
+        req.user!,
+        x.productId,
+        x.type,
+        signed,
+        x.notes,
+        undefined,
+        undefined,
+        undefined,
+        x.businessDate,
+        x.warehouseId,
+      );
       await audit(c, req.user!, x.type, "PRODUCT", x.productId, {
         ...x,
         quantity: signed,
@@ -1974,6 +2367,8 @@ app.get(
            COALESCE(sm.business_date,sm.created_at::date) display_date,
            product.name product_name,
            movement_user.name employee_name,
+           CASE WHEN destination_warehouse.name IS NULL THEN warehouse.name
+             ELSE warehouse.name || ' → ' || destination_warehouse.name END warehouse_name,
            COALESCE(
              sm.supplier_id,
              sale_item.supplier_id,
@@ -1996,6 +2391,9 @@ app.get(
          FROM stock_movements sm
          JOIN products product ON product.id=sm.product_id
          JOIN users movement_user ON movement_user.id=sm.user_id
+         LEFT JOIN warehouses warehouse ON warehouse.id=sm.warehouse_id
+         LEFT JOIN warehouses destination_warehouse
+           ON destination_warehouse.id=sm.destination_warehouse_id
          LEFT JOIN sales sale ON sale.id=sm.reference_id AND sm.type='SALE'
          LEFT JOIN customers sale_customer ON sale_customer.id=sale.customer_id
          LEFT JOIN LATERAL (
@@ -2022,6 +2420,7 @@ app.get(
            return_item.supplier_id
          )
          LEFT JOIN users deleted_user ON deleted_user.id=sm.deleted_by
+         WHERE sm.type IN ('IMPORT','SUPPLIER_RETURN','SOLD','LOST','DESTROYED','CORRECTION','TRANSPORT','REVERSED','DAMAGE','OTHER')
          ORDER BY COALESCE(sm.business_date,sm.created_at::date) DESC,sm.created_at DESC`,
       ),
       pool.query(
@@ -2161,8 +2560,9 @@ app.get(
            ON contact.id=audit.entity_id AND audit.entity_type='CONTACT'
          LEFT JOIN users target_user
            ON target_user.id=audit.entity_id AND audit.entity_type='USER'
-         WHERE NOT (
-           (audit.entity_type='PRODUCT' AND audit.action IN ('CREATE','UPDATE','ARCHIVE','DELETE','IMPORT','LOST','DESTROYED','CORRECTION'))
+         WHERE audit.entity_type IN ('PRODUCT','CATEGORY','SUPPLIER','USER','SETTINGS')
+           AND NOT (
+           (audit.entity_type='PRODUCT' AND audit.action IN ('CREATE','UPDATE','ARCHIVE','DELETE','IMPORT','SUPPLIER_RETURN','SOLD','LOST','DESTROYED','CORRECTION','TRANSPORT'))
            OR (audit.entity_type='RESERVATION' AND audit.action IN ('RESERVE','RESERVATION_CANCEL','RESERVATION_EXPIRE'))
            OR (audit.entity_type='SALE' AND audit.action IN ('SALE','RETURN'))
            OR (audit.entity_type='STOCK_MOVEMENT' AND audit.action='REVERSE_MOVEMENT')
@@ -2238,8 +2638,16 @@ app.get(
         (!search || searchable.includes(search))
       );
     });
-    res.json(
-      filtered.sort((a, b) => {
+    const visibleRows = filtered
+      .map((row) => {
+        const visibleRow = { ...row };
+        delete visibleRow.purchase_price;
+        delete visibleRow.sale_selling_price;
+        delete visibleRow.customer_name;
+        delete visibleRow.sale_number;
+        return visibleRow;
+      })
+      .sort((a, b) => {
         const displayDifference =
           new Date(b.display_date || b.created_at).getTime() -
           new Date(a.display_date || a.created_at).getTime();
@@ -2247,8 +2655,8 @@ app.get(
           displayDifference ||
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
         );
-      }),
-    );
+      });
+    res.json(visibleRows);
   }),
 );
 app.delete(
@@ -2273,7 +2681,7 @@ app.delete(
           "This inventory operation has already been reversed",
         );
       if (
-        !["IMPORT", "LOST", "DESTROYED", "CORRECTION"].includes(m.type)
+        !["IMPORT", "SUPPLIER_RETURN", "SOLD", "LOST", "DESTROYED", "CORRECTION"].includes(m.type)
       )
         throw error(
           "CANNOT_REVERSE",
@@ -2287,7 +2695,19 @@ app.delete(
       );
       const p = product.rows[0],
         newCurrent = p.current_quantity - m.quantity;
-      if (newCurrent < 0 || newCurrent < p.reserved_quantity)
+      const warehouseId = m.warehouse_id || (
+        await c.query("SELECT id FROM warehouses WHERE slug='showroom'")
+      ).rows[0].id;
+      const location = await c.query(
+        "SELECT quantity FROM product_location_stock WHERE product_id=$1 AND warehouse_id=$2 FOR UPDATE",
+        [m.product_id, warehouseId],
+      );
+      const newLocationQuantity = +location.rows[0].quantity - m.quantity;
+      if (
+        newCurrent < 0 ||
+        newCurrent < p.reserved_quantity ||
+        newLocationQuantity < 0
+      )
         throw error(
           "CANNOT_REVERSE",
           "This operation cannot be reversed because it would invalidate current stock or reservations",
@@ -2297,11 +2717,15 @@ app.delete(
         [newCurrent, p.id],
       );
       await c.query(
+        "UPDATE product_location_stock SET quantity=$1,updated_at=now() WHERE product_id=$2 AND warehouse_id=$3",
+        [newLocationQuantity, m.product_id, warehouseId],
+      );
+      await c.query(
         "UPDATE stock_movements SET deleted_at=now(),deleted_by=$1,deletion_reason=$2,notes=CASE WHEN notes IS NULL OR notes='' THEN $2 ELSE notes || ' | Reversal reason: ' || $2 END WHERE id=$3",
         [req.user!.id, reason, movementId],
       );
       await c.query(
-        "INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,supplier_id,purchase_price,notes) VALUES($1,'REVERSED',$2,$3,$4,$5,$6,$7)",
+        "INSERT INTO stock_movements(product_id,type,quantity,user_id,reference_id,supplier_id,purchase_price,notes,warehouse_id) VALUES($1,'REVERSED',$2,$3,$4,$5,$6,$7,$8)",
         [
           m.product_id,
           -m.quantity,
@@ -2310,6 +2734,7 @@ app.delete(
           m.supplier_id,
           m.purchase_price,
           reason,
+          warehouseId,
         ],
       );
       await audit(
@@ -2517,85 +2942,101 @@ app.get(
   "/api/dashboard",
   auth(),
   asyncRoute(async (_q, res) => {
-    await expireReservations();
-    const r = await pool.query(
-      `SELECT
-         (SELECT count(*) FROM products WHERE is_active) AS products,
-         (SELECT COALESCE(sum(current_quantity-reserved_quantity), 0) FROM products WHERE is_active) AS available,
-         (SELECT COALESCE(sum(reserved_quantity), 0) FROM products) AS reserved,
-         (SELECT COALESCE(sum(quantity*selling_price), 0) FROM reservations WHERE status='ACTIVE') AS reserved_total,
-         (SELECT count(*) FROM products WHERE current_quantity=0 AND is_active) AS out_stock,
-         (SELECT count(*) FROM customers) AS customers,
-         (
-           SELECT COALESCE(sum(amount), 0)
-           FROM (
-             SELECT total AS amount FROM sales WHERE business_date=current_date
-             UNION ALL
-             SELECT -(sm.quantity*si.final_unit_price) AS amount
-             FROM stock_movements sm
-             JOIN sale_items si ON si.id=sm.reference_id
-             WHERE sm.type='RETURN' AND sm.deleted_at IS NULL
-               AND COALESCE(sm.business_date,sm.created_at::date)=current_date
-           ) daily_revenue
-         ) AS today_revenue,
-         (
-           SELECT COALESCE(sum(amount), 0)
-           FROM (
-             SELECT total AS amount FROM sales WHERE date_trunc('month',business_date)=date_trunc('month',current_date)
-             UNION ALL
-             SELECT -(sm.quantity*si.final_unit_price) AS amount
-             FROM stock_movements sm
-             JOIN sale_items si ON si.id=sm.reference_id
-             WHERE sm.type='RETURN' AND sm.deleted_at IS NULL
-               AND date_trunc('month',COALESCE(sm.business_date,sm.created_at::date))=date_trunc('month',current_date)
-           ) monthly_revenue
-         ) AS month_revenue`,
-    );
-    const top = await pool.query(
-      `SELECT
-         p.name,
-         sum(si.quantity-COALESCE(ret.quantity, 0)) AS quantity
-       FROM sale_items si
-       JOIN products p ON p.id=si.product_id
-       JOIN sales s ON s.id=si.sale_id
-       LEFT JOIN LATERAL (
-         SELECT sum(quantity) AS quantity
-         FROM stock_movements
-         WHERE reference_id=si.id AND type='RETURN' AND deleted_at IS NULL
-       ) ret ON true
-       WHERE s.status IN ('COMPLETED', 'PARTIALLY_RETURNED')
-       GROUP BY p.id, p.name
-       HAVING sum(si.quantity-COALESCE(ret.quantity, 0)) > 0
-       ORDER BY quantity DESC
-       LIMIT 5`,
-    );
-    const trend = await pool.query(
-      `SELECT to_char(day, 'YYYY-MM-DD') AS date,sum(amount) AS revenue
-       FROM (
-         SELECT business_date AS day,total AS amount
-         FROM sales
-         WHERE business_date >= current_date-interval '30 days'
-         UNION ALL
-         SELECT COALESCE(sm.business_date,sm.created_at::date) AS day,
-                -(sm.quantity*si.final_unit_price) AS amount
-         FROM stock_movements sm
-         JOIN sale_items si ON si.id=sm.reference_id
-         WHERE sm.type='RETURN' AND sm.deleted_at IS NULL
-           AND COALESCE(sm.business_date,sm.created_at::date) >= current_date-interval '30 days'
-       ) activity
-       GROUP BY day
-       ORDER BY day`,
-    );
-    res.json({ ...r.rows[0], topProducts: top.rows, salesTrend: trend.rows });
+    const [summary, locationRows] = await Promise.all([
+      pool.query(
+        `SELECT
+           count(*) FILTER (WHERE is_active)::integer products,
+           COALESCE(sum(current_quantity) FILTER (WHERE is_active),0)::integer physical_stock,
+           count(*) FILTER (WHERE is_active AND current_quantity=0)::integer out_stock,
+           count(*) FILTER (WHERE is_active AND current_quantity BETWEEN 1 AND 2)::integer low_stock,
+           (SELECT count(*)::integer FROM suppliers) suppliers
+         FROM products`,
+      ),
+      pool.query(
+        `SELECT warehouse.id warehouse_id,warehouse.name warehouse_name,
+           warehouse.slug warehouse_slug,warehouse.kind warehouse_kind,
+           COALESCE(sum(COALESCE(stock.quantity,0)) OVER (
+             PARTITION BY warehouse.id
+           ),0)::integer warehouse_stock,
+           count(*) FILTER (WHERE COALESCE(stock.quantity,0)>0) OVER (
+             PARTITION BY warehouse.id
+           )::integer warehouse_products,
+           product.id product_id,
+           product.name product_name,supplier.name supplier_name,
+           category.name category_name,
+           ARRAY(
+             SELECT DISTINCT invoice_import.invoice_code
+             FROM stock_movements invoice_import
+             WHERE invoice_import.product_id=product.id
+               AND invoice_import.type='IMPORT'
+               AND invoice_import.deleted_at IS NULL
+               AND invoice_import.invoice_code IS NOT NULL
+             ORDER BY invoice_import.invoice_code
+           ) invoice_codes,
+           COALESCE(stock.quantity,0)::integer quantity
+         FROM warehouses warehouse
+         LEFT JOIN products product ON product.is_active
+         LEFT JOIN product_location_stock stock
+           ON stock.product_id=product.id AND stock.warehouse_id=warehouse.id
+         LEFT JOIN suppliers supplier ON supplier.id=product.supplier_id
+         LEFT JOIN categories category ON category.id=product.category_id
+         ORDER BY CASE warehouse.kind WHEN 'SHOWROOM' THEN 0 ELSE 1 END,
+           warehouse.name,product.name`,
+      ),
+    ]);
+    const locations = new Map<string, any>();
+    for (const row of locationRows.rows) {
+      let location = locations.get(row.warehouse_id);
+      if (!location) {
+        location = {
+          id: row.warehouse_id,
+          name: row.warehouse_name,
+          slug: row.warehouse_slug,
+          kind: row.warehouse_kind,
+          stock: row.warehouse_stock,
+          products: row.warehouse_products,
+          products_table: [],
+        };
+        locations.set(row.warehouse_id, location);
+      }
+      if (row.product_id && row.quantity > 0)
+        location.products_table.push({
+          warehouse_id: row.warehouse_id,
+          product_id: row.product_id,
+          product_name: row.product_name,
+          supplier_name: row.supplier_name,
+          category_name: row.category_name,
+          invoice_codes: row.invoice_codes,
+          quantity: row.quantity,
+        });
+    }
+    res.json({
+      ...summary.rows[0],
+      locations: [...locations.values()],
+    });
   }),
 );
 app.get(
   "/api/inventory/summary",
   auth(),
-  asyncRoute(async (_q, res) => {
-    const r = await pool.query(
-      "SELECT COALESCE(sum(current_quantity),0) physical_stock,COALESCE(sum(reserved_quantity),0) reserved,COALESCE(sum(current_quantity-reserved_quantity),0) available,COALESCE(sum(current_quantity*purchase_price),0) cost_value FROM products WHERE is_active",
-    );
+  asyncRoute(async (req, res) => {
+    const warehouseId = req.query.warehouseId
+      ? id.parse(String(req.query.warehouseId))
+      : null;
+    const r = warehouseId
+      ? await pool.query(
+          `SELECT COALESCE(sum(stock.quantity),0)::integer physical_stock,
+             count(*) FILTER (WHERE stock.quantity=0)::integer out_stock,
+             count(*) FILTER (WHERE stock.quantity BETWEEN 1 AND 2)::integer low_stock
+           FROM products product
+           LEFT JOIN product_location_stock stock
+             ON stock.product_id=product.id AND stock.warehouse_id=$1
+           WHERE product.is_active`,
+          [warehouseId],
+        )
+      : await pool.query(
+          "SELECT COALESCE(sum(current_quantity),0)::integer physical_stock,count(*) FILTER (WHERE current_quantity=0)::integer out_stock,count(*) FILTER (WHERE current_quantity BETWEEN 1 AND 2)::integer low_stock FROM products WHERE is_active",
+        );
     res.json(r.rows[0]);
   }),
 );
@@ -2606,14 +3047,51 @@ app.get(
     const values: string[] = [];
     const productWhere = ["p.is_active=true"];
     const movementWhere = ["sm.product_id=p.id"];
+    let locationJoin = "";
+    let quantityExpression = "p.current_quantity";
     const add = (target: string[], sql: string, value: string) => {
       values.push(value);
       target.push(sql.replace("?", `$${values.length}`));
     };
+    if (req.query.warehouseId) {
+      const warehouseId = id.parse(String(req.query.warehouseId));
+      values.push(warehouseId);
+      const placeholder = `$${values.length}`;
+      locationJoin = `LEFT JOIN product_location_stock location_stock ON location_stock.product_id=p.id AND location_stock.warehouse_id=${placeholder}`;
+      quantityExpression = "COALESCE(location_stock.quantity,0)";
+      movementWhere.push(
+        `(sm.warehouse_id=${placeholder} OR sm.destination_warehouse_id=${placeholder})`,
+      );
+      productWhere.push(`${quantityExpression}>0`);
+    }
     if (req.query.productId)
       add(productWhere, "p.id=?", String(req.query.productId));
     if (req.query.supplierId)
       add(productWhere, "p.supplier_id=?", String(req.query.supplierId));
+    if (req.query.categoryId)
+      add(productWhere, "p.category_id=?", String(req.query.categoryId));
+    if (req.query.invoiceCode) {
+      const invoiceCode = invoiceCodeSchema.parse(
+        String(req.query.invoiceCode),
+      );
+      values.push(invoiceCode);
+      productWhere.push(
+        `EXISTS(
+           SELECT 1
+           FROM stock_movements invoice_filter
+           WHERE invoice_filter.product_id=p.id
+             AND invoice_filter.type='IMPORT'
+             AND invoice_filter.deleted_at IS NULL
+             AND invoice_filter.invoice_code=$${values.length}
+         )`,
+      );
+    }
+    if (req.query.stockStatus === "OUT")
+      productWhere.push(`${quantityExpression}=0`);
+    if (req.query.stockStatus === "LOW")
+      productWhere.push(`${quantityExpression} BETWEEN 1 AND 2`);
+    if (req.query.stockStatus === "AVAILABLE")
+      productWhere.push(`${quantityExpression}>0`);
     if (req.query.type)
       add(movementWhere, "sm.type=?", String(req.query.type));
     if (req.query.status === "ACTIVE")
@@ -2642,11 +3120,21 @@ app.get(
         `EXISTS(SELECT 1 FROM stock_movements sm WHERE ${movementWhere.join(" AND ")})`,
       );
     const result = await pool.query(
-      `SELECT p.id,p.name product_name,p.current_quantity quantity,
-         p.purchase_price stored_purchase_cost,p.description notes,
-         s.name supplier_name
+      `SELECT p.id,p.name product_name,${quantityExpression} quantity,p.description notes,
+         s.name supplier_name,c.name category_name,
+         ARRAY(
+           SELECT DISTINCT invoice_import.invoice_code
+           FROM stock_movements invoice_import
+           WHERE invoice_import.product_id=p.id
+             AND invoice_import.type='IMPORT'
+             AND invoice_import.deleted_at IS NULL
+             AND invoice_import.invoice_code IS NOT NULL
+           ORDER BY invoice_import.invoice_code
+         ) invoice_codes
        FROM products p
+       ${locationJoin}
        LEFT JOIN suppliers s ON s.id=p.supplier_id
+       LEFT JOIN categories c ON c.id=p.category_id
        WHERE ${productWhere.join(" AND ")}
        ORDER BY p.name`,
       values,
@@ -2663,7 +3151,7 @@ app.get(
       productId,
     ]);
     if (!product.rowCount) throw error("NOT_FOUND", "Product not found", 404);
-    const [movements, deliveries, events] = await Promise.all([
+    const [movements, events] = await Promise.all([
       pool.query(
         `SELECT
            sm.id,
@@ -2672,105 +3160,34 @@ app.get(
            CASE
              WHEN sm.type='REVERSED' THEN NULL
              WHEN sm.deleted_at IS NOT NULL THEN 'REVERSED'
-             WHEN sm.type='SALE' THEN
-               CASE
-                 WHEN GREATEST(COALESCE(pay.paid,0)-COALESCE(ref.refunded,0),0)
-                        >= GREATEST(sa.total-COALESCE(ret.returned_value,0),0)
-                   THEN 'PAID'
-                 WHEN GREATEST(COALESCE(pay.paid,0)-COALESCE(ref.refunded,0),0)>0
-                   THEN 'PARTIALLY_PAID'
-                 ELSE 'UNPAID'
-               END
-             WHEN sm.type='RETURN' THEN rsa.status::text
-             WHEN sm.type IN ('RESERVATION','RESERVATION_RELEASE','RESERVATION_CANCEL')
-               THEN reservation.status::text
              ELSE 'ACTIVE'
            END status,
            abs(sm.quantity) quantity,
-           COALESCE(return_item.final_unit_price,sale_item.final_unit_price,reservation.selling_price,sm.purchase_price) price,
-           COALESCE(sale_customer.name,return_customer.name,reservation_customer.name) customer_name,
            supplier.name supplier_name,
-           COALESCE(sa.sale_number,rsa.sale_number) sale_number,
+           CASE WHEN destination_warehouse.name IS NULL THEN warehouse.name
+             ELSE warehouse.name || ' → ' || destination_warehouse.name END warehouse_name,
            activity_product.name product_name,
            NULL::text field_name,
            NULL::text old_value,
            NULL::text new_value,
            movement_user.name user_name,
+           sm.invoice_code,
            sm.notes
          FROM stock_movements sm
          JOIN products activity_product ON activity_product.id=sm.product_id
          JOIN users movement_user ON movement_user.id=sm.user_id
-         LEFT JOIN sales sa ON sa.id=sm.reference_id AND sm.type='SALE'
-         LEFT JOIN LATERAL (
-           SELECT si.final_unit_price,si.supplier_id
-           FROM sale_items si
-           WHERE si.sale_id=sa.id AND si.product_id=sm.product_id
-           ORDER BY si.id LIMIT 1
-         ) sale_item ON true
-         LEFT JOIN customers sale_customer ON sale_customer.id=sa.customer_id
-         LEFT JOIN sale_items return_item ON return_item.id=sm.reference_id AND sm.type='RETURN'
-         LEFT JOIN sales rsa ON rsa.id=return_item.sale_id
-         LEFT JOIN customers return_customer ON return_customer.id=rsa.customer_id
-         LEFT JOIN reservations reservation
-           ON reservation.id=sm.reference_id
-          AND sm.type IN ('RESERVATION','RESERVATION_RELEASE','RESERVATION_CANCEL')
-         LEFT JOIN customers reservation_customer ON reservation_customer.id=reservation.customer_id
-         LEFT JOIN suppliers supplier
-           ON supplier.id=COALESCE(sm.supplier_id,sale_item.supplier_id,return_item.supplier_id,reservation.supplier_id)
-         LEFT JOIN LATERAL (
-           SELECT sum(amount) paid FROM sale_payments WHERE sale_id=sa.id
-         ) pay ON true
-         LEFT JOIN LATERAL (
-           SELECT sum(amount) refunded FROM sale_refunds WHERE sale_id=sa.id
-         ) ref ON true
-         LEFT JOIN LATERAL (
-           SELECT sum(return_movement.quantity*returned_item.final_unit_price) returned_value
-           FROM stock_movements return_movement
-           JOIN sale_items returned_item ON returned_item.id=return_movement.reference_id
-           WHERE returned_item.sale_id=sa.id
-             AND return_movement.type='RETURN'
-             AND return_movement.deleted_at IS NULL
-         ) ret ON true
-         WHERE sm.product_id=$1`,
-        [productId],
-      ),
-      pool.query(
-        `SELECT DISTINCT
-           audit.id,
-           audit.created_at occurred_at,
-           audit.action type,
-           audit.action status,
-           (SELECT sum(quantity) FROM sale_items WHERE sale_id=sale.id AND product_id=$1) quantity,
-           NULL::numeric price,
-           customer.name customer_name,
-           supplier_names.value supplier_name,
-           sale.sale_number,
-           activity_product.name product_name,
-           NULL::text field_name,
-           NULL::text old_value,
-           NULL::text new_value,
-           audit_user.name user_name,
-           COALESCE(NULLIF(sale.delivery_notes,''),NULLIF(audit.details->>'notes','')) notes
-         FROM audit_logs audit
-         JOIN sales sale ON sale.id=audit.entity_id AND audit.entity_type='SALE'
-         JOIN products activity_product ON activity_product.id=$1
-         LEFT JOIN users audit_user ON audit_user.id=audit.user_id
-         LEFT JOIN customers customer ON customer.id=sale.customer_id
-         LEFT JOIN LATERAL (
-           SELECT string_agg(DISTINCT supplier.name,', ') value
-           FROM sale_items item
-           LEFT JOIN suppliers supplier ON supplier.id=item.supplier_id
-           WHERE item.sale_id=sale.id AND item.product_id=$1
-         ) supplier_names ON true
-         WHERE audit.action IN ('IN_TRANSIT','DELIVERED')
-           AND EXISTS(SELECT 1 FROM sale_items WHERE sale_id=sale.id AND product_id=$1)`,
+         LEFT JOIN suppliers supplier ON supplier.id=sm.supplier_id
+         LEFT JOIN warehouses warehouse ON warehouse.id=sm.warehouse_id
+         LEFT JOIN warehouses destination_warehouse
+           ON destination_warehouse.id=sm.destination_warehouse_id
+         WHERE sm.product_id=$1
+           AND sm.type IN ('IMPORT','SUPPLIER_RETURN','SOLD','LOST','DESTROYED','CORRECTION','TRANSPORT','REVERSED','DAMAGE','OTHER')`,
         [productId],
       ),
       pool.query(
         `SELECT event.id,event.created_at occurred_at,event.action type,
            CASE WHEN event.field_name IS NOT NULL THEN 'CHANGED' ELSE event.action END status,
-           NULL::integer quantity,NULL::numeric price,
-           NULL::text customer_name,NULL::text supplier_name,NULL::bigint sale_number,
+           NULL::integer quantity,NULL::text supplier_name,
            event.product_name,event.field_name,event.old_value,event.new_value,
            event_user.name user_name,event.notes
          FROM product_events event
@@ -2779,12 +3196,31 @@ app.get(
         [productId],
       ),
     ]);
-    res.json(
-      [...movements.rows, ...deliveries.rows, ...events.rows].sort(
+    const activity = [...movements.rows, ...events.rows]
+      .filter(
+        (row) =>
+          row.type === "PRODUCT_CREATED" ||
+          String(row.type || "").endsWith("_CHANGED") ||
+          [
+            "IMPORT",
+            "SUPPLIER_RETURN",
+            "SOLD",
+            "LOST",
+            "DESTROYED",
+            "CORRECTION",
+            "TRANSPORT",
+            "REVERSED",
+            "DAMAGE",
+            "OTHER",
+            "PRODUCT_ARCHIVED",
+            "PRODUCT_DELETED",
+          ].includes(row.type),
+      )
+      .sort(
         (a, b) =>
           new Date(b.occurred_at).getTime() - new Date(a.occurred_at).getTime(),
-      ),
-    );
+      );
+    res.json(activity);
   }),
 );
 app.get(
@@ -2792,7 +3228,9 @@ app.get(
   auth(),
   asyncRoute(async (req, res) => {
     const values: any[] = [],
-      where: string[] = [];
+      where: string[] = [
+        "sm.type IN ('IMPORT','SUPPLIER_RETURN','SOLD','LOST','DESTROYED','CORRECTION','TRANSPORT','REVERSED','DAMAGE','OTHER')",
+      ];
     const add = (sql: string, value: any) => {
       values.push(value);
       where.push(sql.replace("?", `$${values.length}`));
@@ -2801,6 +3239,13 @@ app.get(
       add("sm.product_id=?", String(req.query.productId));
     if (req.query.supplierId)
       add("sm.supplier_id=?", String(req.query.supplierId));
+    if (req.query.warehouseId) {
+      values.push(id.parse(String(req.query.warehouseId)));
+      const warehousePlaceholder = `$${values.length}`;
+      where.push(
+        `(sm.warehouse_id=${warehousePlaceholder} OR sm.destination_warehouse_id=${warehousePlaceholder})`,
+      );
+    }
     if (req.query.type) add("sm.type=?", String(req.query.type));
     if (req.query.status === "ACTIVE")
       where.push("sm.deleted_at IS NULL AND sm.type<>'REVERSED'");
@@ -2817,7 +3262,22 @@ app.get(
         String(req.query.to),
       );
     const r = await pool.query(
-      `SELECT sm.*,COALESCE(sm.purchase_price,p.purchase_price) stored_purchase_cost,COALESCE(sm.business_date,sm.created_at::date) display_date,p.name product_name,u.name employee_name,s.name supplier_name FROM stock_movements sm JOIN products p ON p.id=sm.product_id JOIN users u ON u.id=sm.user_id LEFT JOIN suppliers s ON s.id=sm.supplier_id ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY COALESCE(sm.business_date,sm.created_at::date) DESC,sm.created_at DESC LIMIT 500`,
+      `SELECT sm.id,sm.product_id,sm.type,sm.quantity,sm.user_id,sm.reference_id,
+         sm.supplier_id,sm.business_date,sm.invoice_code,sm.notes,sm.created_at,sm.deleted_at,
+         sm.deleted_by,sm.deletion_reason,
+         COALESCE(sm.business_date,sm.created_at::date) display_date,
+         p.name product_name,u.name employee_name,s.name supplier_name,
+         CASE WHEN destination.name IS NULL THEN w.name
+           ELSE w.name || ' → ' || destination.name END warehouse_name
+       FROM stock_movements sm
+       JOIN products p ON p.id=sm.product_id
+       JOIN users u ON u.id=sm.user_id
+       LEFT JOIN suppliers s ON s.id=sm.supplier_id
+       LEFT JOIN warehouses w ON w.id=sm.warehouse_id
+       LEFT JOIN warehouses destination ON destination.id=sm.destination_warehouse_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY COALESCE(sm.business_date,sm.created_at::date) DESC,sm.created_at DESC
+       LIMIT 500`,
       values,
     );
     res.json(r.rows);

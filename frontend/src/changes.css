@@ -581,12 +581,19 @@ h3 {
   gap: 14px;
   margin-top: 20px;
 }
+.inventory-stock-filters {
+  margin-bottom: 18px;
+}
+.dashboard-location-table {
+  margin-top: 24px;
+}
 .inventory-action-forms form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-content: start;
   gap: 9px 12px;
-  height: 400px;
+  min-height: 490px;
+  height: auto;
   margin: 0;
   padding: 14px;
 }
@@ -601,6 +608,27 @@ h3 {
 }
 .inventory-action-forms form > p {
   align-self: center;
+}
+.new-product-fields {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 9px 12px;
+  min-width: 0;
+}
+.new-product-fields label,
+.adjustment-variable-slot,
+.adjustment-variable-slot > label {
+  min-width: 0;
+}
+.adjustment-variable-slot {
+  min-height: 61px;
+}
+.adjustment-variable-slot > label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  height: 100%;
 }
 .inventory-action-forms .inventory-action {
   align-self: end;
@@ -1125,7 +1153,14 @@ h3 {
   }
   .inventory-action-forms form {
     grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
     height: auto;
+  }
+  .new-product-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .adjustment-variable-slot:empty {
+    display: none;
   }
   .inventory-action-forms form > p {
     grid-column: 1 / -1;
@@ -1368,4 +1403,13 @@ h3 {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
   }
+}
+.stock-low {
+  color: #d99a00;
+  font-weight: 700;
+}
+
+.stock-empty {
+  color: #d33b3b;
+  font-weight: 700;
 }
