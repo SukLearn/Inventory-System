@@ -1,13 +1,3 @@
-export type PaymentStatus = "UNPAID" | "PARTIALLY_PAID" | "PAID";
-export type DeliveryStatus = "IN_TRANSIT" | "DELIVERED";
-export type ReturnStatus =
-  | "COMPLETED"
-  | "PARTIALLY_RETURNED"
-  | "RETURNED";
-export type ReportPeriod = "MONTH" | "QUARTER" | "YEAR";
-
-const roundMoney = (value: number) => Math.round(value * 100) / 100;
-
 export function businessDate(
   date = new Date(),
   timeZone = process.env.APP_TIMEZONE || "Asia/Tbilisi",
@@ -33,85 +23,13 @@ export function isValidDateOnly(value: string) {
   );
 }
 
-function formatDateOnly(year: number, month: number, day = 1) {
-  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-}
-
-export function reportPeriodBounds(
-  period: ReportPeriod,
-  date = new Date(),
-  timeZone = process.env.APP_TIMEZONE || "Asia/Tbilisi",
+export function shouldReserveSoldProduct(
+  availableAtLocation: number,
+  requestedQuantity: number,
 ) {
-  const [year, month] = businessDate(date, timeZone).split("-").map(Number);
-  const startMonth =
-    period === "YEAR"
-      ? 1
-      : period === "QUARTER"
-        ? Math.floor((month - 1) / 3) * 3 + 1
-        : month;
-  const months = period === "YEAR" ? 12 : period === "QUARTER" ? 3 : 1;
-  const endIndex = startMonth - 1 + months;
-  const endYear = year + Math.floor(endIndex / 12);
-  const endMonth = (endIndex % 12) + 1;
-
-  return {
-    from: formatDateOnly(year, startMonth),
-    to: formatDateOnly(endYear, endMonth),
-  };
+  return availableAtLocation < requestedQuantity;
 }
 
-export function calculateSaleBalance(
-  total: number,
-  grossPaid: number,
-  refunded: number,
-  returnedValue: number,
-) {
-  const effectiveTotal = Math.max(0, roundMoney(total - returnedValue));
-  const paid = Math.max(0, roundMoney(grossPaid - refunded));
-  const remaining = Math.max(0, roundMoney(effectiveTotal - paid));
-  const paymentStatus: PaymentStatus =
-    paid <= 0
-      ? effectiveTotal === 0
-        ? "PAID"
-        : "UNPAID"
-      : paid >= effectiveTotal
-        ? "PAID"
-        : "PARTIALLY_PAID";
-
-  return { effectiveTotal, paid, remaining, paymentStatus };
-}
-
-export function calculateReservationBalance(
-  quantity: number,
-  unitPrice: number,
-  deposit: number,
-) {
-  const total = roundMoney(quantity * unitPrice);
-  return {
-    total,
-    remaining: Math.max(0, roundMoney(total - deposit)),
-  };
-}
-
-export function nextDeliveryStatus(current: string): DeliveryStatus {
-  return current === "IN_TRANSIT" || current === "DELIVERED"
-    ? "DELIVERED"
-    : "IN_TRANSIT";
-}
-
-export function returnStatus(
-  items: Array<{ quantity: number; returned: number }>,
-): ReturnStatus {
-  if (items.length && items.every((item) => item.returned >= item.quantity))
-    return "RETURNED";
-  if (items.some((item) => item.returned > 0)) return "PARTIALLY_RETURNED";
-  return "COMPLETED";
-}
-
-export function returnNote(
-  productName: string,
-  quantity: number,
-  notes: string,
-) {
-  return `RETURN | ${productName} | Quantity: ${quantity} | Notes: ${notes}`;
+export function isValidInvoiceCode(value: string) {
+  return /^\d+$/.test(value);
 }

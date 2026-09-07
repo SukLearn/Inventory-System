@@ -102,6 +102,24 @@ td {
 th {
   background: #eef1f4;
 }
+.invoice-links a,
+.supplier-link {
+  color: inherit;
+  font: inherit;
+  font-weight: inherit;
+  text-decoration: none;
+}
+.invoice-links a:hover,
+.invoice-links a:focus-visible,
+.supplier-link:hover,
+.supplier-link:focus-visible {
+  color: #18733c;
+  text-decoration: underline;
+}
+.invoice-links a:active,
+.supplier-link:active {
+  color: #b42318;
+}
 .sort {
   background: transparent;
   color: inherit;
@@ -142,6 +160,10 @@ form label {
 .error {
   color: #b42318;
   font-weight: bold;
+}
+.success {
+  color: #18733c;
+  font-weight: 600;
 }
 .login {
   max-width: 360px;

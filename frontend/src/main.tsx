@@ -20,7 +20,7 @@ import "@fontsource/open-sans/latin-400.css";
 import "@fontsource/open-sans/latin-500.css";
 import "@fontsource/open-sans/latin-600.css";
 import "@fontsource/open-sans/latin-700.css";
-import logoUrl from "../logo/root_servere.png";
+import logoUrl from "../logo/Website.png";
 import "./style.css";
 import "./changes.css";
 import {
@@ -225,7 +225,14 @@ function InvoiceCodeInput({
   const suggestionsId = useId();
   return (
     <>
-      <NumericInput {...props} integer list={suggestionsId} autoComplete="off" />
+      <input
+        {...props}
+        type="text"
+        inputMode="numeric"
+        pattern="[0-9]+"
+        list={suggestionsId}
+        autoComplete="off"
+      />
       <datalist id={suggestionsId}>
         {codes.map((invoice) => (
           <option key={invoice.code} value={invoice.code} />
@@ -272,7 +279,7 @@ function EmployeePasswordButton({
   return <button onClick={reset}>Reset password</button>;
 }
 const preferenceEvent = "furniture-shop-preferences";
-const readShopName = () => localStorage.getItem("shopName") || "Furniture Shop";
+const readShopName = () => localStorage.getItem("shopName") || "Rom Classic";
 const applyTheme = (theme = localStorage.getItem("theme") || "White") =>
   (document.documentElement.dataset.theme = theme.toLowerCase());
 applyTheme();
@@ -431,6 +438,136 @@ function CategoryManagement() {
     </section>
   );
 }
+
+function InvoiceCodeManagement() {
+  const [invoices, setInvoices] = useState<O[]>([]);
+  const [message, setMessage] = useState("");
+  const [open, setOpen] = useState(false);
+  const load = () =>
+    api("/invoices")
+      .then(setInvoices)
+      .catch((error) => setMessage(error.message));
+  useEffect(load, []);
+  const remove = async (invoice: O) => {
+    if (!confirm(`Delete invoice code “${invoice.code}”?`)) return;
+    try {
+      await api(`/invoices/${encodeURIComponent(invoice.code)}`, {
+        method: "DELETE",
+      });
+      setMessage("Invoice code deleted successfully.");
+      void load();
+    } catch (error: any) {
+      setMessage(error.message);
+    }
+  };
+  return (
+    <section className="category-management invoice-code-management">
+      <button
+        type="button"
+        className="category-management-toggle"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>Invoice Code Management</span>
+        <span aria-hidden="true">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="category-management-content">
+          <form
+            className="inline category-create-form"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              const form = event.currentTarget;
+              const code = String(
+                new FormData(form).get("code") || "",
+              ).trim();
+              try {
+                await api("/invoices", {
+                  method: "POST",
+                  body: JSON.stringify({ code }),
+                });
+                form.reset();
+                setMessage("Invoice code created successfully.");
+                void load();
+              } catch (error: any) {
+                setMessage(error.message);
+              }
+            }}
+          >
+            <label>
+              Invoice code
+              <InvoiceCodeInput codes={invoices} name="code" required />
+            </label>
+            <button className="form-submit">Create invoice code</button>
+          </form>
+          {message && (
+            <p
+              className={
+                message === "Invoice Contains Products, It can't be DELETED"
+                  ? "error"
+                  : ""
+              }
+            >
+              {message}
+            </p>
+          )}
+          <T
+            rows={invoices}
+            cols={[
+              [
+                "Invoice code",
+                (invoice) => <InvoiceLinks invoiceCodes={[invoice.code]} />,
+                (invoice) => invoice.code,
+              ],
+              ["Products", (invoice) => invoice.product_count],
+              [
+                "Manage",
+                (invoice) => (
+                  <form
+                    key={invoice.code}
+                    className="category-row-editor"
+                    onSubmit={async (event) => {
+                      event.preventDefault();
+                      const code = String(
+                        new FormData(event.currentTarget).get("code") || "",
+                      ).trim();
+                      try {
+                        await api(
+                          `/invoices/${encodeURIComponent(invoice.code)}`,
+                          {
+                            method: "PATCH",
+                            body: JSON.stringify({ code }),
+                          },
+                        );
+                        setMessage("Invoice code renamed successfully.");
+                        void load();
+                      } catch (error: any) {
+                        setMessage(error.message);
+                      }
+                    }}
+                  >
+                    <InvoiceCodeInput
+                      codes={[]}
+                      name="code"
+                      defaultValue={invoice.code}
+                      aria-label={`Rename invoice ${invoice.code}`}
+                      required
+                    />
+                    <button>Save</button>
+                    <button type="button" onClick={() => remove(invoice)}>
+                      Delete
+                    </button>
+                  </form>
+                ),
+              ],
+            ]}
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+
 function SettingsWithPreferences({ admin }: { admin: boolean }) {
   const [shopName, setShopName] = useState(readShopName()),
     [theme, setTheme] = useState(localStorage.getItem("theme") || "White"),
@@ -438,7 +575,7 @@ function SettingsWithPreferences({ admin }: { admin: boolean }) {
     [message, setMessage] = useState("");
   const save = (e: React.FormEvent) => {
     e.preventDefault();
-    const name = shopName.trim() || "Furniture Shop";
+    const name = shopName.trim() || "Rom Classic";
     localStorage.setItem("shopName", name);
     localStorage.setItem("theme", theme);
     saveLanguage(language);
@@ -546,7 +683,12 @@ function SettingsWithPreferences({ admin }: { admin: boolean }) {
           {message}
         </p>
       )}
-      {admin && <CategoryManagement />}
+      {admin && (
+        <>
+          <CategoryManagement />
+          <InvoiceCodeManagement />
+        </>
+      )}
     </>
   );
 }
@@ -597,9 +739,21 @@ function InventoryWithSummary({ warehouse }: { warehouse: O }) {
     api("/inventory/products?" + q)
       .then((rows) =>
         setInventoryRows(
-          rows.map((row: O, displayId: number) => ({
+          rowsByInvoice(
+            rows.map((row: O) => ({
+              ...row,
+              quantity: filters.invoiceCode
+                ? (row.invoice_stock || []).reduce(
+                    (sum: number, invoice: O) =>
+                      sum + +invoice.remaining_quantity,
+                    0,
+                  )
+                : row.quantity,
+            })),
+            "quantity",
+          ).map((row: O, displayId: number) => ({
             ...row,
-            display_id: displayId,
+            display_id: displayId + 1,
           })),
         ),
       )
@@ -707,7 +861,11 @@ function InventoryWithSummary({ warehouse }: { warehouse: O }) {
           [
             "Invoice code",
             (row) =>
-              row.invoice_codes?.length ? row.invoice_codes.join(", ") : "—",
+              row.invoice_code ? (
+                <InvoiceLinks invoiceCodes={[row.invoice_code]} />
+              ) : (
+                "—"
+              ),
           ],
           ["Quantity", (row) => <StockValue value={row.quantity} />],
           ["Notes", (row) => <NoteButton note={row.notes} label="View" />],
@@ -723,6 +881,7 @@ function InventoryDetail({ admin }: { admin: boolean }) {
   const [suppliers, setSuppliers] = useState<O[]>([]);
   const [activity, setActivity] = useState<O[]>([]);
   const [message, setMessage] = useState("");
+  const [selectedInvoiceCode, setSelectedInvoiceCode] = useState("");
   const load = () => {
     if (!productId) return;
     return Promise.all([
@@ -817,18 +976,30 @@ function InventoryDetail({ admin }: { admin: boolean }) {
           </label>
           <label>
             Invoice code
-            <input
-              value={
-                product.invoice_codes?.length
-                  ? product.invoice_codes.join(", ")
-                  : ""
-              }
-              readOnly
-            />
+            <select
+              value={selectedInvoiceCode}
+              onChange={(event) => setSelectedInvoiceCode(event.target.value)}
+            >
+              <option value="">All invoice codes</option>
+              {(product.invoice_stock || []).map((invoice: O) => (
+                <option key={invoice.code} value={invoice.code}>
+                  {invoice.code}
+                </option>
+              ))}
+            </select>
           </label>
           <label>
             Current quantity
-            <input value={product.current_quantity} readOnly   />
+            <input
+              value={
+                selectedInvoiceCode
+                  ? product.invoice_stock?.find(
+                      (invoice: O) => invoice.code === selectedInvoiceCode,
+                    )?.remaining_quantity || 0
+                  : product.current_quantity
+              }
+              readOnly
+            />
           </label>
           <label>
             Last imported date
@@ -1022,22 +1193,63 @@ function T({
             ];
   return (
     <section className="data-table">
-      <label className="table-record-limit">
-        Show records
-        <select
-          value={pageSize}
-          onChange={(event) => {
-            setPageSize(+event.target.value as 5 | 10 | 20 | 50 | 100);
-            setPage(1);
-          }}
-        >
-          {[5, 10, 20, 50, 100].map((size) => (
-            <option key={size} value={size}>
-              {size}
-            </option>
-          ))}
-        </select>
-      </label>
+      <div className="data-table-toolbar">
+        <label className="table-record-limit">
+          Show records
+          <select
+            value={pageSize}
+            onChange={(event) => {
+              setPageSize(+event.target.value as 5 | 10 | 20 | 50 | 100);
+              setPage(1);
+            }}
+          >
+            {[5, 10, 20, 50, 100].map((size) => (
+              <option key={size} value={size}>
+                {size}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="mobile-table-sort">
+          <label>
+            Sort by
+            <select
+              value={sort?.index ?? ""}
+              onChange={(event) => {
+                const index = event.target.value;
+                setPage(1);
+                setSort(
+                  index === ""
+                    ? null
+                    : { index: Number(index), direction: sort?.direction || 1 },
+                );
+              }}
+            >
+              <option value="">Original order</option>
+              {cols.map((column, index) => (
+                <option key={column[0]} value={index}>
+                  {column[0]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button
+            type="button"
+            disabled={!sort}
+            aria-label="Reverse sort direction"
+            onClick={() => {
+              setPage(1);
+              setSort((current) =>
+                current
+                  ? { ...current, direction: current.direction === 1 ? -1 : 1 }
+                  : null,
+              );
+            }}
+          >
+            {sort?.direction === -1 ? "Descending" : "Ascending"}
+          </button>
+        </div>
+      </div>
       <div className="table">
         <table>
         <thead>
@@ -1058,9 +1270,17 @@ function T({
         </thead>
         <tbody>
           {visibleRows.map((x, index) => (
-            <tr key={x.id || firstRow + index}>
+            <tr
+              key={[
+                x.id || x.product_id || "row",
+                x.invoice_code || "",
+                firstRow + index,
+              ].join(":")}
+            >
               {cols.map((c) => (
-                <td key={c[0]}>{c[1](x, firstRow + index)}</td>
+                <td key={c[0]} data-label={c[0]}>
+                  {c[1](x, firstRow + index)}
+                </td>
               ))}
             </tr>
           ))}
@@ -1354,11 +1574,12 @@ function Dashboard() {
     ["Showroom Products", locations.showroom?.products || 0],
     ["Low Stock", d.low_stock],
     ["Out of Stock", d.out_stock],
+    ["Reserved", d.reserved_products],
   ];
   return (
     <>
       <h2>Dashboard</h2>
-      <section className="cards">
+      <section className="cards dashboard-cards">
         {a.map((x) => (
           <div className="card" key={String(x[0])}>
             <small>{x[0]}</small>
@@ -1370,7 +1591,7 @@ function Dashboard() {
         <section className="dashboard-location-table" key={location.id}>
           <h3>{location.name}</h3>
           <T
-            rows={location.products_table || []}
+            rows={rowsByInvoice(location.products_table || [], "quantity")}
             cols={[
               [
                 "Product",
@@ -1389,15 +1610,211 @@ function Dashboard() {
               [
                 "Invoice code",
                 (product) =>
-                  product.invoice_codes?.length
-                    ? product.invoice_codes.join(", ")
-                    : "—",
+                  product.invoice_code ? (
+                    <InvoiceLinks invoiceCodes={[product.invoice_code]} />
+                  ) : (
+                    "—"
+                  ),
               ],
               ["Quantity", (product) => <StockValue value={product.quantity} />],
             ]}
           />
         </section>
       ))}
+    </>
+  );
+}
+
+function InvoiceLinks({
+  invoiceStock,
+  invoiceCodes,
+}: {
+  invoiceStock?: O[];
+  invoiceCodes?: string[];
+}) {
+  const entries: O[] = invoiceStock?.length
+    ? invoiceStock
+    : (invoiceCodes || []).map((code) => ({ code }));
+  if (!entries.length) return <>—</>;
+  return (
+    <span className="invoice-links">
+      {entries.map((invoice, index) => (
+        <React.Fragment key={invoice.code}>
+          {index > 0 && ", "}
+          <Link to={`/invoice/${encodeURIComponent(invoice.code)}`}>
+            {invoice.code}
+          </Link>
+          {invoice.remaining_quantity !== undefined &&
+            ` (${invoice.remaining_quantity})`}
+        </React.Fragment>
+      ))}
+    </span>
+  );
+}
+
+function invoiceWarehouses(warehouseStock: O[] = []) {
+  if (!warehouseStock.length) return "—";
+  return warehouseStock
+    .map((warehouse) => `${warehouse.warehouse_name} (${warehouse.quantity})`)
+    .join(", ");
+}
+
+function rowsByInvoice(rows: O[], quantityField: string) {
+  return rows.flatMap((row) => {
+    const totalQuantity = +row[quantityField] || 0;
+    const invoiceRows = (row.invoice_stock || []).map((invoice: O) => ({
+      ...row,
+      invoice_code: invoice.code,
+      [quantityField]: +invoice.remaining_quantity || 0,
+    }));
+    const trackedQuantity = invoiceRows.reduce(
+      (sum: number, invoice: O) => sum + +invoice[quantityField],
+      0,
+    );
+    const unassignedQuantity = Math.max(0, totalQuantity - trackedQuantity);
+    if (!invoiceRows.length || unassignedQuantity > 0)
+      invoiceRows.push({
+        ...row,
+        invoice_code: null,
+        [quantityField]: unassignedQuantity || totalQuantity,
+      });
+    return invoiceRows;
+  });
+}
+
+function ReservedProducts() {
+  const [rows, setRows] = useState<O[]>([]);
+  const [message, setMessage] = useState("");
+  const [completingId, setCompletingId] = useState("");
+  const load = () =>
+    api("/inventory/reservations")
+      .then((result) => {
+        setRows(result);
+        setMessage("");
+      })
+      .catch((error) => setMessage(error.message));
+  useEffect(load, []);
+  const complete = async (row: O) => {
+    if (
+      !confirm(
+        `Complete the reserved sale of ${row.quantity} × ${row.product_name}? Stock will be subtracted from ${row.warehouse_name}.`,
+      )
+    )
+      return;
+    setCompletingId(row.id);
+    try {
+      await api(`/inventory/reservations/${row.id}/complete`, {
+        method: "POST",
+      });
+      await load();
+    } catch (error: any) {
+      setMessage(error.message);
+    } finally {
+      setCompletingId("");
+    }
+  };
+  return (
+    <>
+      <h2>Reserved</h2>
+      {message && <p className="error">{message}</p>}
+      <T
+        rows={rows}
+        cols={[
+          ["Supplier", (row) => row.supplier_name || "—"],
+          ["Selling date", (row) => dt(row.action_date)],
+          ["Product", (row) => row.product_name],
+          ["Quantity", (row) => row.quantity],
+          ["Warehouse", (row) => row.warehouse_name],
+          ["Available now", (row) => <StockValue value={row.available_quantity} />],
+          [
+            "Action",
+            (row) => {
+              const ready = +row.available_quantity >= +row.quantity;
+              return (
+                <button
+                  type="button"
+                  disabled={!ready || completingId === row.id}
+                  title={ready ? "" : "Import enough stock at this location first"}
+                  onClick={() => complete(row)}
+                >
+                  {completingId === row.id
+                    ? "Completing…"
+                    : ready
+                      ? "Complete sale"
+                      : "Waiting for import"}
+                </button>
+              );
+            },
+          ],
+        ]}
+      />
+    </>
+  );
+}
+
+function InvoiceDetails() {
+  const { code = "" } = useParams();
+  const [details, setDetails] = useState<O>();
+  const [selectedDate, setSelectedDate] = useState("");
+  const [message, setMessage] = useState("");
+  useEffect(() => {
+    const query = selectedDate
+      ? `?importDate=${encodeURIComponent(selectedDate)}`
+      : "";
+    api(`/invoices/${encodeURIComponent(code)}${query}`)
+      .then((result) => {
+        setDetails(result);
+        if (!selectedDate) setSelectedDate(result.selected_date || "");
+        setMessage("");
+      })
+      .catch((error) => setMessage(error.message));
+  }, [code, selectedDate]);
+  return (
+    <>
+      <h2>Invoice {code}</h2>
+      {message && <p className="error">{message}</p>}
+      {details && (
+        <>
+          {details.dates.length > 0 && (
+            <label className="invoice-date-filter">
+              Import date
+              <select
+                value={selectedDate}
+                onChange={(event) => setSelectedDate(event.target.value)}
+              >
+                {details.dates.map((date: string) => (
+                  <option key={date} value={date}>
+                    {dt(date)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <T
+            rows={details.products}
+            cols={[
+              ["Supplier", (row) => row.supplier_name || "—"],
+              [
+                "Product",
+                (row) => (
+                  <Link
+                    className="inventory-id-link"
+                    to={`/inventory/${row.product_id}`}
+                  >
+                    {row.product_name}
+                  </Link>
+                ),
+                (row) => row.product_name,
+              ],
+              ["Warehouse", (row) => invoiceWarehouses(row.warehouse_stock)],
+              ["Imported quantity", (row) => row.imported_quantity],
+              ["Remaining on invoice", (row) => (
+                <StockValue value={row.remaining_quantity} />
+              )],
+            ]}
+          />
+        </>
+      )}
     </>
   );
 }
@@ -1631,9 +2048,22 @@ function Products() {
     return api("/products?" + query)
       .then((rows) => {
         sr(
-          rows.map((product: O, displayId: number) => ({
+          rowsByInvoice(
+            rows.map((product: O) => ({
+              ...product,
+              displayed_quantity:
+                filters.invoiceCode
+                  ? (product.invoice_stock || []).reduce(
+                      (sum: number, invoice: O) =>
+                        sum + +invoice.remaining_quantity,
+                      0,
+                    )
+                  : product.warehouse_quantity ?? product.current_quantity,
+            })),
+            "displayed_quantity",
+          ).map((product: O, displayId: number) => ({
             ...product,
-            display_id: displayId,
+            display_id: displayId + 1,
           })),
         );
         se("");
@@ -1682,7 +2112,11 @@ function Products() {
   columns.push([
     "Invoice code",
     (product) =>
-      product.invoice_codes?.length ? product.invoice_codes.join(", ") : "—",
+      product.invoice_code ? (
+        <InvoiceLinks invoiceCodes={[product.invoice_code]} />
+      ) : (
+        "—"
+      ),
   ]);
   if (!filters.warehouseId)
     columns.push([
@@ -1695,11 +2129,7 @@ function Products() {
   columns.push(
     [
       "In stock",
-      (product) => (
-        <StockValue
-          value={product.warehouse_quantity ?? product.current_quantity}
-        />
-      ),
+      (product) => <StockValue value={product.displayed_quantity} />,
     ],
     ["Status", (product) => (product.is_active ? "Active" : "Inactive")],
   );
@@ -1862,7 +2292,7 @@ function Suppliers({ admin }: { admin: boolean }) {
             "Supplier",
             (supplier) => (
               <Link
-                className="inventory-id-link"
+                className="supplier-link"
                 to={`/suppliers/${encodeURIComponent(supplier.name)}`}
                 state={{ supplierId: supplier.id }}
               >
@@ -2007,7 +2437,16 @@ function MovementTable({
     cols.splice(
       cols.length - 1,
       0,
-      ["Invoice code", (x: O) => x.invoice_code || "—"],
+      [
+        "Invoice code",
+        (x: O) =>
+          x.invoice_code ? (
+            <InvoiceLinks invoiceCodes={[x.invoice_code]} />
+          ) : (
+            "—"
+          ),
+        (x: O) => x.invoice_code || "",
+      ],
       ["Warehouse", (x: O) => x.warehouse_name || "—"],
     );
   if (allowDelete)
@@ -2050,13 +2489,16 @@ function MovementTable({
 }
 function Inventory({ admin }: { admin: boolean }) {
   const [products, setProducts] = useState<O[]>([]),
+    [adjustmentProducts, setAdjustmentProducts] = useState<O[]>([]),
     [warehouses, setWarehouses] = useState<O[]>([]),
     [categories, setCategories] = useState<O[]>([]),
     [suppliers, setSuppliers] = useState<O[]>([]),
     [invoices, setInvoices] = useState<O[]>([]),
     [h, sh] = useState<O[]>([]),
     [e, se] = useState(""),
+    [notice, setNotice] = useState(""),
     [importProductId, setImportProductId] = useState(""),
+    [adjustmentProductId, setAdjustmentProductId] = useState(""),
     [invoiceSelection, setInvoiceSelection] = useState("NEW"),
     [reason, setReason] = useState("SUPPLIER_RETURN"),
     [direction, setDirection] = useState("INCREASE"),
@@ -2090,24 +2532,50 @@ function Inventory({ admin }: { admin: boolean }) {
       .catch((error) => se(error.message));
   };
   useEffect(load, []);
+  useEffect(() => {
+    setAdjustmentProductId("");
+    if (!adjustmentWarehouseId) {
+      setAdjustmentProducts([]);
+      return;
+    }
+    let cancelled = false;
+    const includeEmpty = reason === "TRANSPORT" ? "" : "&includeEmpty=true";
+    api(
+      `/products?warehouseId=${encodeURIComponent(adjustmentWarehouseId)}${includeEmpty}`,
+    )
+      .then((rows) => {
+        if (cancelled) return;
+        setAdjustmentProducts(
+          reason === "TRANSPORT"
+            ? rows.filter((product: O) => +product.warehouse_quantity > 0)
+            : rows,
+        );
+      })
+      .catch((error) => {
+        if (!cancelled) se(error.message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [adjustmentWarehouseId, reason]);
   const submit =
     (url: string) => async (x: React.FormEvent<HTMLFormElement>) => {
       x.preventDefault();
       const form = x.currentTarget;
       const f = new FormData(form);
       try {
-        const body = url.endsWith("/import")
+        const describesProduct =
+          url.endsWith("/import") && f.get("productId") === "NEW";
+        const body = describesProduct
           ? {
-              productId:
-                f.get("productId") === "NEW" ? null : f.get("productId"),
-              newProduct:
-                f.get("productId") === "NEW"
-                  ? {
-                      name: f.get("productName"),
-                      categoryId: f.get("categoryId"),
-                      supplierId: f.get("supplierId"),
-                    }
-                  : undefined,
+              name: f.get("productName"),
+              categoryId: f.get("categoryId"),
+              supplierId: f.get("supplierId"),
+              description: f.get("description") || null,
+            }
+          : url.endsWith("/import")
+          ? {
+              productId: f.get("productId"),
               warehouseId: f.get("warehouseId"),
               quantity: +f.get("quantity")!,
               importDate: f.get("importDate"),
@@ -2128,25 +2596,52 @@ function Inventory({ admin }: { admin: boolean }) {
               businessDate: f.get("businessDate"),
               notes: f.get("notes"),
             };
-        await api(url, { method: "POST", body: JSON.stringify(body) });
+        const result = await api(describesProduct ? "/products" : url, {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
         form.reset();
         setImportProductId("");
+        setAdjustmentProductId("");
         setInvoiceSelection("NEW");
         setReason("SUPPLIER_RETURN");
         setDirection("INCREASE");
         setAdjustmentWarehouseId("");
         setDestinationWarehouseId("");
+        setNotice(
+          describesProduct
+            ? "Product described with quantity 0. It can now be marked as sold."
+            : result?.reserved
+              ? "There was not enough stock at this location, so the sold product was added to Reserved."
+              : "Inventory action saved successfully.",
+        );
         load();
       } catch (z: any) {
+        setNotice("");
         se(z.message);
       }
     };
   const pick = (
-    <select name="productId" required>
-      <option value="">Product</option>
-      {products.map((x) => (
+    <select
+      name="productId"
+      required
+      disabled={
+        !adjustmentWarehouseId ||
+        (reason === "TRANSPORT" && !adjustmentProducts.length)
+      }
+      value={adjustmentProductId}
+      onChange={(event) => setAdjustmentProductId(event.target.value)}
+    >
+      <option value="">
+        {!adjustmentWarehouseId
+          ? "Select warehouse first"
+          : reason === "TRANSPORT" && !adjustmentProducts.length
+            ? "No products available to transport"
+            : "Product"}
+      </option>
+      {adjustmentProducts.map((x) => (
         <option key={x.id} value={x.id}>
-          {x.name} ({x.available_quantity})
+          {x.name} ({x.warehouse_quantity})
         </option>
       ))}
     </select>
@@ -2163,11 +2658,10 @@ function Inventory({ admin }: { admin: boolean }) {
   );
   return (
     <>
-      <h2>Import / export</h2>
+      <h2>Import</h2>
       <div className="twocol inventory-action-forms">
         <form onSubmit={submit("/inventory/import")}>
           <h3>Import</h3>
-          <label>Warehouse{warehousePick}</label>
           <label>
             Product
             <select
@@ -2215,47 +2709,62 @@ function Inventory({ admin }: { admin: boolean }) {
                   ))}
                 </select>
               </label>
+              <label>
+                Description
+                <textarea name="description" placeholder="Optional" />
+              </label>
             </div>
           )}
-          <label>
-            Quantity
-            <NumericInput name="quantity" integer min="1" required />
-          </label>
-          <label>
-            Invoice
-            <select
-              value={invoiceSelection}
-              onChange={(event) => setInvoiceSelection(event.target.value)}
-              required
-            >
-              <option value="NEW">+ New invoice</option>
-              {invoices.map((invoice) => (
-                <option key={invoice.code} value={invoice.code}>
-                  {invoice.code}
-                </option>
-              ))}
-            </select>
-          </label>
-          {invoiceSelection === "NEW" && (
-            <label>
-              New invoice code
-              <NumericInput name="newInvoiceCode" integer required />
-            </label>
+          {importProductId !== "NEW" && (
+            <>
+              <label>Warehouse{warehousePick}</label>
+              <label>
+                Quantity
+                <NumericInput name="quantity" integer min="1" required />
+              </label>
+              <label>
+                Invoice
+                <select
+                  value={invoiceSelection}
+                  onChange={(event) => setInvoiceSelection(event.target.value)}
+                  required
+                >
+                  <option value="NEW">+ New invoice</option>
+                  {invoices.map((invoice) => (
+                    <option key={invoice.code} value={invoice.code}>
+                      {invoice.code}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {invoiceSelection === "NEW" && (
+                <label>
+                  New invoice code
+                  <InvoiceCodeInput
+                    codes={[]}
+                    name="newInvoiceCode"
+                    required
+                  />
+                </label>
+              )}
+              <label>
+                Import date
+                <input
+                  name="importDate"
+                  type="date"
+                  defaultValue={today()}
+                  required
+                />
+              </label>
+              <label>
+                Notes
+                <input name="notes" placeholder="Optional" />
+              </label>
+            </>
           )}
-          <label>
-            Import date
-            <input
-              name="importDate"
-              type="date"
-              defaultValue={today()}
-              required
-            />
-          </label>
-          <label>
-            Notes
-            <input name="notes" placeholder="Optional" />
-          </label>
-          <button className="form-submit inventory-action">Import</button>
+          <button className="form-submit inventory-action">
+            {importProductId === "NEW" ? "Describe product" : "Import"}
+          </button>
         </form>
         <form onSubmit={submit("/inventory/adjust")}>
           <h3>Adjustment</h3>
@@ -2342,7 +2851,7 @@ function Inventory({ admin }: { admin: boolean }) {
             )}
           </div>
           <label>
-            Adjustment date
+            {reason === "SOLD" ? "Reservation Date" : "Adjustment date"}
             <input
               name="businessDate"
               type="date"
@@ -2360,11 +2869,13 @@ function Inventory({ admin }: { admin: boolean }) {
         </form>
       </div>
       {e && <p className="error">{e}</p>}
+      {notice && <p className="success">{notice}</p>}
       <h3>Actions</h3>
       <MovementTable
         rows={h}
         reload={load}
         allowDelete
+        showEmployee={false}
         showWarehouse
       />
     </>
@@ -2798,12 +3309,11 @@ function Shell({ u, out }: { u: O; out: () => void }) {
               {x}
             </NavLink>
           ))}
-          <NavLink to="/import-export">Import / export</NavLink>
+          <NavLink to="/import-export">Import</NavLink>
+          <NavLink to="/reserved">Reserved</NavLink>
           <NavLink to="/showroom">Showroom</NavLink>
-          <NavigationDropdown label="Warehouses">
-            <NavLink to="/warehouses/galovani">Galovani</NavLink>
-            <NavLink to="/warehouses/isani">Isani</NavLink>
-          </NavigationDropdown>
+          <NavLink to="/warehouses/galovani">Galovani</NavLink>
+          <NavLink to="/warehouses/isani">Isani</NavLink>
           <NavLink to="/suppliers">Suppliers</NavLink>
           <NavLink to="/history">History</NavLink>
           <NavigationDropdown label="Other">
@@ -2827,12 +3337,22 @@ function Shell({ u, out }: { u: O; out: () => void }) {
             path="/import-export"
             element={<Inventory admin={u.role === "ADMIN"} />}
           />
+          <Route path="/reserved" element={<ReservedProducts />} />
+          <Route
+            path="/invoice/:code"
+            element={<InvoiceDetails key={location.pathname} />}
+          />
           <Route path="/showroom" element={<InventoryLocation slug="showroom" />} />
           <Route path="/warehouses/galovani" element={<InventoryLocation slug="galovani" />} />
           <Route path="/warehouses/isani" element={<InventoryLocation slug="isani" />} />
           <Route
             path="/inventory/:id"
-            element={<InventoryDetail admin={u.role === "ADMIN"} />}
+            element={
+              <InventoryDetail
+                key={location.pathname}
+                admin={u.role === "ADMIN"}
+              />
+            }
           />
           <Route path="/suppliers" element={<Suppliers admin={u.role === "ADMIN"} />} />
           <Route path="/suppliers/:supplierName" element={<SupplierDetail />} />

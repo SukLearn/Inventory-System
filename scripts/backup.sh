@@ -1,6 +1,6 @@
 #!/bin/sh
 
-set -u
+set -eu
 
 BACKUP_ROOT="${BACKUP_ROOT:-/backups}"
 UPLOAD_ROOT="${UPLOAD_ROOT:-/uploads}"
